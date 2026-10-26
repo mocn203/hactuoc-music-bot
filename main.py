@@ -1597,28 +1597,26 @@ async def start_web_server():
         st_res = await zing_engine._call_node("stream", sid)
         pl_res = await zing_engine._call_node("playlist", pl_id)
 
+        from unittest.mock import MagicMock
+        mock_member = MagicMock()
+        mock_member.mention = "@DebugUser"
+
         yt_probe = None
         if yt_q:
             clean_yt = yt_q.strip()
-            is_url = bool(re.match(r"^https?://", clean_yt))
-            target = clean_yt if is_url else f"ytsearch1:{clean_yt}"
-            info = await multi_engine._extract_ytdl_async(target, is_playlist=False)
-            if info:
-                entry = info["entries"][0] if "entries" in info and info["entries"] else info
+            song_yt = await multi_engine.resolve_song(clean_yt, mock_member)
+            if song_yt:
                 yt_probe = {
-                    "title": entry.get("title"),
-                    "uploader": entry.get("uploader"),
-                    "duration": entry.get("duration"),
-                    "has_url": bool(entry.get("url")),
-                    "url": entry.get("url")[:80] if entry.get("url") else None
+                    "title": song_yt.title,
+                    "uploader": song_yt.artists,
+                    "duration": song_yt.duration_sec,
+                    "source_type": song_yt.source_type,
+                    "has_url": bool(song_yt.stream_url),
+                    "url": song_yt.stream_url[:80] if song_yt.stream_url else None
                 }
 
         sp_probe = None
         if sp_q:
-            # Fake mock member for debug probe
-            from unittest.mock import MagicMock
-            mock_member = MagicMock()
-            mock_member.mention = "@DebugUser"
             song = await multi_engine.resolve_spotify(sp_q.strip(), mock_member)
             if song:
                 sp_probe = {
