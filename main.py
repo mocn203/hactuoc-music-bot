@@ -86,14 +86,17 @@ class ZingEngine:
         # Cache dictionaries with TTL
         self.search_cache: Dict[str, Dict[str, Any]] = {}  # query -> {data, expiry}
         self.stream_cache: Dict[str, Dict[str, Any]] = {}  # song_id -> {data, expiry}
+        self.playlist_cache: Dict[str, Dict[str, Any]] = {} # playlist_id -> {data, expiry}
         self.SEARCH_TTL = 3600       # 1 hour
         self.STREAM_TTL = 7200       # 2 hours
+        self.PLAYLIST_TTL = 3600     # 1 hour
         self.MAX_CACHE_ENTRIES = 250 # Zero-leak memory bound
 
     def _clean_cache(self):
         now = time.time()
         self.search_cache = {k: v for k, v in self.search_cache.items() if v["expiry"] > now}
         self.stream_cache = {k: v for k, v in self.stream_cache.items() if v["expiry"] > now}
+        self.playlist_cache = {k: v for k, v in self.playlist_cache.items() if v["expiry"] > now}
 
         # Zero-leak bound: limit max cache size to prevent unbounded memory growth
         if len(self.search_cache) > self.MAX_CACHE_ENTRIES:
@@ -103,6 +106,10 @@ class ZingEngine:
         if len(self.stream_cache) > self.MAX_CACHE_ENTRIES:
             sorted_stream = sorted(self.stream_cache.items(), key=lambda item: item[1]["expiry"], reverse=True)
             self.stream_cache = dict(sorted_stream[:self.MAX_CACHE_ENTRIES])
+
+        if len(self.playlist_cache) > self.MAX_CACHE_ENTRIES:
+            sorted_playlist = sorted(self.playlist_cache.items(), key=lambda item: item[1]["expiry"], reverse=True)
+            self.playlist_cache = dict(sorted_playlist[:self.MAX_CACHE_ENTRIES])
 
     async def _call_node(self, action: str, query: str) -> Dict[str, Any]:
         """Execute node zing.js asynchronously with 12s timeout to prevent process leaks"""
@@ -170,6 +177,23 @@ class ZingEngine:
             self.stream_cache[key] = {
                 "data": res,
                 "expiry": now + self.STREAM_TTL
+            }
+        return res
+
+    async def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
+        """Fetch playlist/album details and songs with in-memory caching"""
+        self._clean_cache()
+        key = playlist_id.strip()
+        now = time.time()
+        if key in self.playlist_cache and self.playlist_cache[key]["expiry"] > now:
+            logger.info(f"⚡ [Cache Hit] Playlist Zing MP3: '{playlist_id}'")
+            return self.playlist_cache[key]["data"]
+
+        res = await self._call_node("playlist", playlist_id)
+        if res.get("success") and res.get("songs"):
+            self.playlist_cache[key] = {
+                "data": res,
+                "expiry": now + self.PLAYLIST_TTL
             }
         return res
 
@@ -587,15 +611,30 @@ class MusicBotInstance:
 
         @bot.command(name="play", aliases=["p"])
         async def cmd_play(ctx: commands.Context, *, query: Optional[str] = None):
-            """Phát nhạc từ Zing MP3"""
+            """Phát nhạc từ Zing MP3 hoặc toàn bộ Album/Playlist"""
             prefix = instance.prefixes[0]
             if not query:
-                return await ctx.reply(f"⚠️ Vui lòng nhập tên bài hát hoặc link Zing MP3! (Ví dụ: `{prefix}play Cắt Đôi Nỗi Sầu`)")
+                return await ctx.reply(f"⚠️ Vui lòng nhập tên bài hát hoặc link Zing MP3! (Ví dụ: `{prefix}play Cắt Đôi Nỗi Sầu` hoặc link Album/Playlist)")
 
             if not ctx.author.voice or not ctx.author.voice.channel:
                 return await ctx.reply("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!")
 
             voice_channel = ctx.author.voice.channel
+
+            # Detect playlist / album URLs (e.g. /(album|playlist)/[^/]+/([A-Za-z0-9]+)\.html)
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            if pl_match:
+                searching_msg = await ctx.send("🔍 Đang nạp toàn bộ Album / Playlist từ Zing MP3... Chờ xíu nha 💿")
+                return await instance.play_playlist_helper(
+                    ctx,
+                    pl_match.group(1),
+                    ctx.author,
+                    voice_channel,
+                    ctx.channel,
+                    searching_msg=searching_msg,
+                    is_slash=False
+                )
+
             vc = ctx.guild.voice_client
 
             if vc is None:
@@ -637,6 +676,31 @@ class MusicBotInstance:
                 player.queue.append(song)
                 await searching_msg.delete()
                 await instance.start_next_song(ctx.guild.id)
+
+        @bot.command(name="playlist", aliases=["album", "pl"])
+        async def cmd_playlist(ctx: commands.Context, *, query: Optional[str] = None):
+            """Phát toàn bộ Album hoặc Playlist từ Zing MP3"""
+            prefix = instance.prefixes[0]
+            if not query:
+                return await ctx.reply(f"⚠️ Vui lòng nhập link hoặc ID Album / Playlist Zing MP3! (Ví dụ: `{prefix}playlist ZWZB969E`)")
+
+            if not ctx.author.voice or not ctx.author.voice.channel:
+                return await ctx.reply("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!")
+
+            voice_channel = ctx.author.voice.channel
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            playlist_id = pl_match.group(1) if pl_match else query.strip()
+
+            searching_msg = await ctx.send(f"🔍 Đang nạp toàn bộ Album / Playlist **{playlist_id}**... Chờ xíu nha 💿")
+            await instance.play_playlist_helper(
+                ctx,
+                playlist_id,
+                ctx.author,
+                voice_channel,
+                ctx.channel,
+                searching_msg=searching_msg,
+                is_slash=False
+            )
 
         @bot.command(name="skip", aliases=["s", "next"])
         async def cmd_skip(ctx: commands.Context):
@@ -951,6 +1015,94 @@ class MusicBotInstance:
             embed.set_footer(text="Opus Native Pipeline (Sub-5ms) 🎧")
             await interaction.response.send_message(embed=embed)
 
+        @bot.tree.command(name="play", description="🎵 Phát nhạc hoặc toàn bộ Album/Playlist từ Zing MP3")
+        @app_commands.describe(query="Tên bài hát, link bài hát hoặc link Album/Playlist Zing MP3")
+        async def slash_play(interaction: discord.Interaction, query: str):
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("❌ Lệnh này chỉ dùng trong máy chủ!", ephemeral=True)
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+                return await interaction.response.send_message("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!", ephemeral=True)
+
+            await interaction.response.defer()
+            voice_channel = member.voice.channel
+
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            if pl_match:
+                return await instance.play_playlist_helper(
+                    interaction,
+                    pl_match.group(1),
+                    member,
+                    voice_channel,
+                    interaction.channel,
+                    searching_msg=None,
+                    is_slash=True
+                )
+
+            vc = guild.voice_client
+            if vc is None:
+                try:
+                    vc = await voice_channel.connect()
+                except Exception as e:
+                    return await interaction.followup.send(f"❌ Không thể tham gia phòng Voice: {e}")
+            elif vc.channel != voice_channel:
+                await vc.move_to(voice_channel)
+
+            song = await zing_engine.resolve_song(query, member)
+            if not song:
+                return await interaction.followup.send(f"❌ Không thể tìm thấy hoặc lấy luồng nhạc bài **{query}** (có thể là bài VIP).")
+
+            player = instance.get_player(guild.id)
+            player.text_channel = interaction.channel
+
+            if vc.is_playing() or vc.is_paused():
+                player.queue.append(song)
+                embed = discord.Embed(
+                    title=f"📥 ₊˚ ĐÃ THÊM VÀO HÀNG ĐỢI • {instance.name} ✦",
+                    description=(
+                        f"🎵 **Bài hát:** **{song.title}**\n"
+                        f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                        f"⏱️ **Thời lượng:** `{song.duration_str}`\n"
+                        f"🔢 **Vị trí hàng đợi:** `#{len(player.queue)}`\n"
+                        f"👤 **Người yêu cầu:** {member.mention}"
+                    ),
+                    color=instance.embed_color
+                )
+                if song.thumbnail:
+                    embed.set_thumbnail(url=song.thumbnail)
+                embed.set_footer(text=f"Gõ {instance.prefixes[0]}queue để xem toàn bộ danh sách chờ")
+                await interaction.followup.send(embed=embed)
+            else:
+                player.queue.append(song)
+                await instance.start_next_song(guild.id)
+                await interaction.followup.send(f"🎶 Đang chuẩn bị phát: **{song.title}** - `{song.artists}`")
+
+        @bot.tree.command(name="playlist", description="💿 Phát toàn bộ Album hoặc Playlist từ Zing MP3")
+        @app_commands.describe(query="Link hoặc ID Album/Playlist Zing MP3")
+        async def slash_playlist(interaction: discord.Interaction, query: str):
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("❌ Lệnh này chỉ dùng trong máy chủ!", ephemeral=True)
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+                return await interaction.response.send_message("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!", ephemeral=True)
+
+            await interaction.response.defer()
+            voice_channel = member.voice.channel
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            playlist_id = pl_match.group(1) if pl_match else query.strip()
+
+            await instance.play_playlist_helper(
+                interaction,
+                playlist_id,
+                member,
+                voice_channel,
+                interaction.channel,
+                searching_msg=None,
+                is_slash=True
+            )
+
         @bot.command(name="help", aliases=["h"])
         async def cmd_help(ctx: commands.Context):
             """Hướng dẫn sử dụng bot nhạc Zing MP3"""
@@ -959,7 +1111,8 @@ class MusicBotInstance:
                 title=f"ᕱ⑅ᕱ ₊˚ HƯỚNG DẪN • {instance.name.upper()} ✦",
                 description=(
                     f"**{instance.name}** chuyên phụ trách phòng âm nhạc: `{instance.room_label}`\n\n"
-                    f"🎵 `{p}play <tên bài / link>` (hoặc `{p}p`): Phát nhạc Zing MP3 siêu tốc\n"
+                    f"🎵 `{p}play <tên bài / link>` (hoặc `/play`): Phát nhạc Zing MP3 siêu tốc\n"
+                    f"💿 `{p}playlist <link / ID>` (hoặc `/playlist`, `{p}album`): Phát toàn bộ Album / Playlist Zing MP3\n"
                     f"🚀 `/boost` hoặc `{p}boost [mức độ]` (hoặc `{p}b`): Bật Bass Boost cực xịn (Tắt/Nhẹ/Vừa/Mạnh/Cực đại)\n"
                     f"⏭️ `{p}skip` (hoặc `{p}s`): Bỏ qua bài hát hiện tại\n"
                     f"⏸️ `{p}pause`: Tạm dừng phát nhạc\n"
@@ -1005,7 +1158,9 @@ class MusicBotInstance:
         """Warm up Zing cache for upcoming track in background"""
         try:
             if song.id:
-                await zing_engine.get_stream(song.id)
+                res = await zing_engine.get_stream(song.id)
+                if res.get("streamUrl") and not song.stream_url:
+                    song.stream_url = res["streamUrl"]
         except Exception:
             pass
 
@@ -1044,8 +1199,34 @@ class MusicBotInstance:
                     await player.text_channel.send(embed=embed)
                 return
 
-            # Song is already pre-resolved into direct CDN URL
-            song = player.queue.pop(0)
+            song = None
+            while player.queue:
+                candidate = player.queue.pop(0)
+                if not candidate.stream_url:
+                    stream_res = await zing_engine.get_stream(candidate.id)
+                    if stream_res.get("success") and stream_res.get("streamUrl"):
+                        candidate.stream_url = stream_res["streamUrl"]
+                    else:
+                        if player.text_channel:
+                            await player.text_channel.send(f"⚠️ Bỏ qua `{candidate.title}` (VIP / không có luồng phát miễn phí).")
+                        continue
+                song = candidate
+                break
+
+            if not song:
+                player.current = None
+                player.song_start_time = None
+                player.pause_start_time = None
+                player.total_paused_sec = 0.0
+                gc.collect()
+                if player.text_channel and not player.is_manual_stop:
+                    embed = discord.Embed(
+                        description=f"✨ Đã phát hết danh sách bài hát trong hàng đợi! Dùng `{self.prefixes[0]}play <tên bài>` để tiếp tục nghe nhạc nhé 🎶",
+                        color=self.embed_color
+                    )
+                    await player.text_channel.send(embed=embed)
+                return
+
             player.current = song
 
             try:
@@ -1095,6 +1276,111 @@ class MusicBotInstance:
                 if player.text_channel:
                     await player.text_channel.send(f"❌ Có lỗi khi phát bài `{song.title}`: {e}")
                 self.handle_track_finished(guild_id, e)
+
+    async def play_playlist_helper(
+        self,
+        ctx_or_interaction,
+        playlist_id: str,
+        user: discord.Member,
+        voice_channel: discord.VoiceChannel,
+        channel: discord.TextChannel,
+        searching_msg=None,
+        is_slash: bool = False
+    ):
+        """Helper to fetch, queue and play an entire Album / Playlist from Zing MP3"""
+        guild = user.guild
+        vc = guild.voice_client
+
+        if vc is None:
+            try:
+                vc = await voice_channel.connect()
+            except Exception as e:
+                err_text = f"❌ Không thể tham gia phòng Voice: {e}"
+                if searching_msg:
+                    return await searching_msg.edit(content=err_text)
+                elif is_slash:
+                    return await ctx_or_interaction.followup.send(err_text)
+                else:
+                    return await ctx_or_interaction.reply(err_text)
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+
+        pl_data = await zing_engine.get_playlist(playlist_id)
+        if not pl_data.get("success") or not pl_data.get("songs"):
+            err_text = f"❌ {pl_data.get('error', 'Không tìm thấy Album / Playlist trên Zing MP3 hoặc danh sách trống!')}"
+            if searching_msg:
+                return await searching_msg.edit(content=err_text)
+            elif is_slash:
+                return await ctx_or_interaction.followup.send(err_text)
+            else:
+                return await ctx_or_interaction.reply(err_text)
+
+        raw_songs = pl_data["songs"]
+        pl_title = pl_data.get("title", "Album / Playlist")
+        pl_thumb = pl_data.get("thumbnail", "")
+        total_songs = len(raw_songs)
+        song_objs = [Song(s, user) for s in raw_songs]
+
+        player = self.get_player(guild.id)
+        player.text_channel = channel
+
+        is_idle = not vc.is_playing() and not vc.is_paused()
+
+        if is_idle:
+            first_song = None
+            while song_objs:
+                candidate = song_objs[0]
+                st_res = await zing_engine.get_stream(candidate.id)
+                if st_res.get("success") and st_res.get("streamUrl"):
+                    candidate.stream_url = st_res["streamUrl"]
+                    first_song = candidate
+                    break
+                else:
+                    song_objs.pop(0)
+
+            if not first_song:
+                err_text = "❌ Tất cả bài hát trong Album/Playlist này đều thuộc diện VIP hoặc không có luồng phát miễn phí!"
+                if searching_msg:
+                    return await searching_msg.edit(content=err_text)
+                elif is_slash:
+                    return await ctx_or_interaction.followup.send(err_text)
+                else:
+                    return await ctx_or_interaction.reply(err_text)
+
+            player.queue.extend(song_objs)
+            queue_pos_desc = "▶️ **Đang bắt đầu phát bài đầu tiên**"
+            await self.start_next_song(guild.id)
+        else:
+            start_pos = len(player.queue) + 1
+            end_pos = len(player.queue) + len(song_objs)
+            queue_pos_desc = f"`#{start_pos}` đến `#{end_pos}`"
+            player.queue.extend(song_objs)
+
+        embed = discord.Embed(
+            title="💿 ₊˚ ĐÃ THÊM TOÀN BỘ ALBUM / PLAYLIST ✦",
+            description=(
+                f"📀 **Album / Playlist:** **{pl_title}**\n"
+                f"🔢 **Tổng số bài hát đã thêm:** `{total_songs}` bài\n"
+                f"📍 **Vị trí hàng đợi:** {queue_pos_desc}\n"
+                f"👤 **Người yêu cầu:** {user.mention}\n\n"
+                f"💡 Gõ `{self.prefixes[0]}queue` để xem danh sách chờ • `{self.prefixes[0]}skip` để bỏ qua bài"
+            ),
+            color=self.embed_color
+        )
+        if pl_thumb:
+            embed.set_thumbnail(url=pl_thumb)
+        embed.set_footer(text=f"Zing MP3 Opus Engine • {self.name} • {self.prefixes[0]}pl 🎶")
+
+        if searching_msg:
+            try:
+                await searching_msg.delete()
+            except Exception:
+                pass
+            await channel.send(embed=embed)
+        elif is_slash:
+            await ctx_or_interaction.followup.send(embed=embed)
+        else:
+            await channel.send(embed=embed)
 
     async def memory_optimizer_loop(self):
         """Periodic memory maintenance: prune cache, reap dead tasks, prune idle players, run GC"""

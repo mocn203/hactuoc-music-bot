@@ -73,6 +73,40 @@ async function main() {
         duration: info.duration || 0,
         durationStr: formatDuration(info.duration || 0)
       }));
+    } else if (action === "playlist" || action === "album") {
+      let playlistId = query.trim();
+      const urlMatch = playlistId.match(/(?:album|playlist)\/[^/]+\/([A-Za-z0-9]+)\.html/);
+      if (urlMatch) {
+        playlistId = urlMatch[1];
+      }
+      const res = await ZingMp3.getDetailPlaylist(playlistId);
+      if (!res || res.err !== 0 || !res.data) {
+        console.log(JSON.stringify({ error: res?.msg || "Không tìm thấy Album / Playlist trên Zing MP3" }));
+        return;
+      }
+      const data = res.data;
+      const rawSongs = data.song?.items || [];
+      const songs = rawSongs.filter(s => s && s.encodeId).map(s => ({
+        id: s.encodeId,
+        title: s.title || "Không rõ tiêu đề",
+        artists: s.artistsNames || (s.artists ? s.artists.map(a => a.name).join(", ") : "Nhiều nghệ sĩ"),
+        thumbnail: s.thumbnailM || s.thumbnail || "",
+        duration: s.duration || 0,
+        durationStr: formatDuration(s.duration || 0)
+      }));
+
+      if (songs.length === 0) {
+        console.log(JSON.stringify({ error: "Album / Playlist không có bài hát khả dụng" }));
+        return;
+      }
+
+      console.log(JSON.stringify({
+        success: true,
+        title: data.title || "Album / Playlist",
+        thumbnail: data.thumbnailM || data.thumbnail || (songs[0] ? songs[0].thumbnail : ""),
+        total: songs.length,
+        songs: songs
+      }));
     } else {
       console.log(JSON.stringify({ error: "Unknown action" }));
     }
