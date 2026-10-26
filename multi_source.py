@@ -46,6 +46,18 @@ def build_spotify_search_query(title: str, artists: List[str]) -> str:
     query = f"{core_title} {' '.join(top_artists)}".strip()
     return re.sub(r'\s+', ' ', query)
 
+def fetch_youtube_oembed(video_url: str) -> Optional[Dict[str, Any]]:
+    """Fetch structured metadata directly from YouTube's public oEmbed API without bot checks or datacenter IP restrictions"""
+    try:
+        clean_url = video_url.split("&")[0].strip()
+        oembed_url = f"https://www.youtube.com/oembed?url={urllib.request.quote(clean_url, safe=':/?=&')}&format=json"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logger.debug(f"YouTube oEmbed fetch error for '{video_url}': {e}")
+        return None
+
 class Song:
     """Universal Song model supporting Zing MP3, YouTube, SoundCloud, Spotify, and Direct Streams"""
     def __init__(self, data: Dict[str, Any], requester: discord.Member):
@@ -84,7 +96,7 @@ class MultiSourceEngine:
         self.MAX_CACHE_ENTRIES = 300
         self.last_error: str = ""
 
-        # High-resilience yt-dlp config with YouTube bot bypass (visionos/android player clients)
+        # High-resilience yt-dlp config with YouTube bot bypass (android_vr/tv_embedded clients bypass datacenter IP blocks)
         self.ytdl_base_opts = {
             "format": "bestaudio/best",
             "noplaylist": True,
@@ -94,7 +106,7 @@ class MultiSourceEngine:
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["visionos", "android"]
+                    "player_client": ["android_vr", "tv_embedded"]
                 }
             }
         }
@@ -107,7 +119,7 @@ class MultiSourceEngine:
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["visionos", "android"]
+                    "player_client": ["android_vr", "tv_embedded"]
                 }
             }
         }
@@ -176,6 +188,79 @@ class MultiSourceEngine:
             return Song(cached_data, requester)
 
         info = await self._extract_ytdl_async(target, is_playlist=False)
+
+        # Multi-layer fallback for direct YouTube URLs if yt-dlp was challenged or blocked
+        if not info and is_url:
+            logger.info(f"⚠️ Direct yt-dlp extraction failed for '{clean_q}'. Attempting YouTube oEmbed fallback...")
+            loop = asyncio.get_running_loop()
+            oembed_meta = await loop.run_in_executor(None, fetch_youtube_oembed, clean_q)
+            if oembed_meta:
+                yt_title = html.unescape(oembed_meta.get("title", ""))
+                uploader = html.unescape(oembed_meta.get("author_name", "Nghệ sĩ YouTube"))
+                thumb = oembed_meta.get("thumbnail_url", "")
+                logger.info(f"🟢 YouTube oEmbed resolved: '{yt_title}' by '{uploader}'. Finding alternative audio stream...")
+
+                fallback_song = None
+                # 1. Search Zing MP3 if available
+                if self.zing_engine and yt_title:
+                    try:
+                        fallback_song = await self.zing_engine.resolve_song(yt_title, requester)
+                    except Exception as e:
+                        logger.debug(f"Zing fallback error: {e}")
+
+                # 2. Search SoundCloud
+                if not fallback_song and yt_title:
+                    try:
+                        fallback_song = await self.resolve_soundcloud(yt_title, requester)
+                    except Exception as e:
+                        logger.debug(f"SoundCloud fallback error: {e}")
+
+                # 3. Search YouTube by title (often bypasses direct video bot block)
+                if not fallback_song and yt_title:
+                    try:
+                        search_target = f"ytsearch1:{yt_title}"
+                        info_search = await self._extract_ytdl_async(search_target, is_playlist=False)
+                        if info_search:
+                            entry = info_search["entries"][0] if "entries" in info_search and info_search["entries"] else info_search
+                            if entry and entry.get("url"):
+                                s_dur = int(entry.get("duration") or 0)
+                                fallback_song = Song({
+                                    "id": entry.get("id", ""),
+                                    "title": yt_title,
+                                    "artists": uploader,
+                                    "thumbnail": thumb or entry.get("thumbnail", ""),
+                                    "streamUrl": entry.get("url"),
+                                    "duration": s_dur,
+                                    "durationStr": format_duration(s_dur),
+                                    "source_type": "youtube",
+                                    "webpage_url": clean_q,
+                                    "resolved_at": now
+                                }, requester)
+                    except Exception as e:
+                        logger.debug(f"YouTube title search fallback error: {e}")
+
+                if fallback_song:
+                    fallback_song.title = yt_title
+                    fallback_song.artists = uploader
+                    if thumb:
+                        fallback_song.thumbnail = thumb
+                    fallback_song.source_type = "youtube"
+                    fallback_song.webpage_url = clean_q
+                    song_data = {
+                        "id": fallback_song.id,
+                        "title": fallback_song.title,
+                        "artists": fallback_song.artists,
+                        "thumbnail": fallback_song.thumbnail,
+                        "streamUrl": fallback_song.stream_url,
+                        "duration": fallback_song.duration_sec,
+                        "durationStr": fallback_song.duration_str,
+                        "source_type": "youtube",
+                        "webpage_url": clean_q,
+                        "resolved_at": now
+                    }
+                    self.cache[cache_key] = {"data": song_data, "expiry": now + self.CACHE_TTL}
+                    return fallback_song
+
         if not info:
             return None
 
@@ -347,6 +432,12 @@ class MultiSourceEngine:
             if not song and search_query != title:
                 song = await self.zing_engine.resolve_song(title, requester)
 
+        # Fallback to SoundCloud if both YouTube and Zing fail
+        if not song:
+            song = await self.resolve_soundcloud(search_query, requester)
+            if not song and search_query != title:
+                song = await self.resolve_soundcloud(title, requester)
+
         if song:
             song.title = title
             if artists:
@@ -388,7 +479,12 @@ class MultiSourceEngine:
         platform = self.detect_platform(query_or_url)
 
         if platform == "youtube":
-            return await self.resolve_youtube(query_or_url, requester)
+            song = await self.resolve_youtube(query_or_url, requester)
+            if not song and self.zing_engine:
+                song = await self.zing_engine.resolve_song(query_or_url, requester)
+            if not song:
+                song = await self.resolve_soundcloud(query_or_url, requester)
+            return song
         elif platform == "soundcloud":
             return await self.resolve_soundcloud(query_or_url, requester)
         elif platform == "spotify":
@@ -402,7 +498,10 @@ class MultiSourceEngine:
                     song.source_type = "zing"
                     return song
             # Fallback to YouTube if Zing fails
-            return await self.resolve_youtube(query_or_url, requester)
+            song = await self.resolve_youtube(query_or_url, requester)
+            if not song:
+                song = await self.resolve_soundcloud(query_or_url, requester)
+            return song
         else: # "zing_default"
             # 1. Try Zing MP3 first for Vietnamese queries
             if self.zing_engine:
@@ -417,6 +516,8 @@ class MultiSourceEngine:
             # 2. Seamless fallback to YouTube for VIP songs or unindexed tracks
             logger.info(f"🔄 Zing MP3 returned no free stream for '{query_or_url}'. Falling back to YouTube...")
             song = await self.resolve_youtube(query_or_url, requester)
+            if not song:
+                song = await self.resolve_soundcloud(query_or_url, requester)
             return song
 
     async def refresh_stream_url(self, song: Song, force: bool = False) -> str:
@@ -441,6 +542,10 @@ class MultiSourceEngine:
                 yt_song = await self.resolve_youtube(search_q, song.requester)
                 if not yt_song and search_q != song.title:
                     yt_song = await self.resolve_youtube(song.title, song.requester)
+                if not yt_song and self.zing_engine:
+                    yt_song = await self.zing_engine.resolve_song(search_q, song.requester)
+                if not yt_song:
+                    yt_song = await self.resolve_soundcloud(search_q, song.requester)
                 if yt_song and yt_song.stream_url:
                     song.stream_url = yt_song.stream_url
                     song.resolved_at = now
