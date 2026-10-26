@@ -75,7 +75,7 @@ async function main() {
       }));
     } else if (action === "playlist" || action === "album") {
       let playlistId = query.trim();
-      const urlMatch = playlistId.match(/(?:album|playlist)\/[^/]+\/([A-Za-z0-9]+)\.html/);
+      const urlMatch = playlistId.match(/(?:album|playlist)\/(?:[^/]+\/)?([A-Za-z0-9]+)(?:\.html)?/);
       if (urlMatch) {
         playlistId = urlMatch[1];
       }
@@ -85,11 +85,22 @@ async function main() {
         return;
       }
       const data = res.data;
-      const rawSongs = data.song?.items || [];
+      let rawSongs = data.song?.items || [];
+      if (rawSongs.length === 0 && Array.isArray(data.items)) {
+        rawSongs = data.items;
+      }
+      if (rawSongs.length === 0 && Array.isArray(data.sections)) {
+        for (const sec of data.sections) {
+          if (sec.items && Array.isArray(sec.items)) {
+            rawSongs = sec.items;
+            break;
+          }
+        }
+      }
       const songs = rawSongs.filter(s => s && s.encodeId).map(s => ({
         id: s.encodeId,
         title: s.title || "Không rõ tiêu đề",
-        artists: s.artistsNames || (s.artists ? s.artists.map(a => a.name).join(", ") : "Nhiều nghệ sĩ"),
+        artists: s.artistsNames || (Array.isArray(s.artists) ? s.artists.map(a => a.name).join(", ") : "Nhiều nghệ sĩ"),
         thumbnail: s.thumbnailM || s.thumbnail || "",
         duration: s.duration || 0,
         durationStr: formatDuration(s.duration || 0)

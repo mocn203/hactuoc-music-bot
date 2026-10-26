@@ -622,7 +622,7 @@ class MusicBotInstance:
             voice_channel = ctx.author.voice.channel
 
             # Detect playlist / album URLs (e.g. /(album|playlist)/[^/]+/([A-Za-z0-9]+)\.html)
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
             if pl_match:
                 searching_msg = await ctx.send("🔍 Đang nạp toàn bộ Album / Playlist từ Zing MP3... Chờ xíu nha 💿")
                 return await instance.play_playlist_helper(
@@ -688,7 +688,7 @@ class MusicBotInstance:
                 return await ctx.reply("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!")
 
             voice_channel = ctx.author.voice.channel
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
             playlist_id = pl_match.group(1) if pl_match else query.strip()
 
             searching_msg = await ctx.send(f"🔍 Đang nạp toàn bộ Album / Playlist **{playlist_id}**... Chờ xíu nha 💿")
@@ -1028,7 +1028,7 @@ class MusicBotInstance:
             await interaction.response.defer()
             voice_channel = member.voice.channel
 
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
             if pl_match:
                 return await instance.play_playlist_helper(
                     interaction,
@@ -1090,7 +1090,7 @@ class MusicBotInstance:
 
             await interaction.response.defer()
             voice_channel = member.voice.channel
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)\.html", query)
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
             playlist_id = pl_match.group(1) if pl_match else query.strip()
 
             await instance.play_playlist_helper(
@@ -1318,7 +1318,6 @@ class MusicBotInstance:
         raw_songs = pl_data["songs"]
         pl_title = pl_data.get("title", "Album / Playlist")
         pl_thumb = pl_data.get("thumbnail", "")
-        total_songs = len(raw_songs)
         song_objs = [Song(s, user) for s in raw_songs]
 
         player = self.get_player(guild.id)
@@ -1347,20 +1346,21 @@ class MusicBotInstance:
                 else:
                     return await ctx_or_interaction.reply(err_text)
 
+            actual_count = len(song_objs)
+            queue_pos_desc = f"▶️ Đang phát bài 1 (`#1` đến `#{actual_count}`)" if actual_count > 1 else "▶️ Đang phát ngay"
             player.queue.extend(song_objs)
-            queue_pos_desc = "▶️ **Đang bắt đầu phát bài đầu tiên**"
-            await self.start_next_song(guild.id)
         else:
+            actual_count = len(song_objs)
             start_pos = len(player.queue) + 1
-            end_pos = len(player.queue) + len(song_objs)
+            end_pos = len(player.queue) + actual_count
             queue_pos_desc = f"`#{start_pos}` đến `#{end_pos}`"
             player.queue.extend(song_objs)
 
         embed = discord.Embed(
-            title="💿 ₊˚ ĐÃ THÊM TOÀN BỘ ALBUM / PLAYLIST ✦",
+            title="💿 ĐÃ THÊM TOÀN BỘ ALBUM / PLAYLIST ✦",
             description=(
                 f"📀 **Album / Playlist:** **{pl_title}**\n"
-                f"🔢 **Tổng số bài hát đã thêm:** `{total_songs}` bài\n"
+                f"🔢 **Tổng số bài hát đã thêm:** `{actual_count}` bài\n"
                 f"📍 **Vị trí hàng đợi:** {queue_pos_desc}\n"
                 f"👤 **Người yêu cầu:** {user.mention}\n\n"
                 f"💡 Gõ `{self.prefixes[0]}queue` để xem danh sách chờ • `{self.prefixes[0]}skip` để bỏ qua bài"
@@ -1381,6 +1381,9 @@ class MusicBotInstance:
             await ctx_or_interaction.followup.send(embed=embed)
         else:
             await channel.send(embed=embed)
+
+        if is_idle:
+            await self.start_next_song(guild.id)
 
     async def memory_optimizer_loop(self):
         """Periodic memory maintenance: prune cache, reap dead tasks, prune idle players, run GC"""
@@ -1492,6 +1495,7 @@ async def start_web_server():
             "active_bots_count": sum(1 for b in CLUSTER_BOTS if b.bot.is_ready()),
             "cached_searches": len(zing_engine.search_cache),
             "cached_streams": len(zing_engine.stream_cache),
+            "cached_playlists": len(zing_engine.playlist_cache),
             "bots": bot_statuses,
             "timestamp": datetime.datetime.now().isoformat()
         })
@@ -1502,13 +1506,22 @@ async def start_web_server():
     async def handle_debug(request):
         q = request.query.get("q", "một bước yêu vạn dặm đau")
         sid = request.query.get("id", "B4Dxqgg21UI")
+        pl_id = request.query.get("pl", "ZWZB969E")
         s_res = await zing_engine._call_node("search", q)
         st_res = await zing_engine._call_node("stream", sid)
+        pl_res = await zing_engine._call_node("playlist", pl_id)
         return web.json_response({
             "query": q,
             "search_result": s_res,
             "stream_id": sid,
-            "stream_result": st_res
+            "stream_result": st_res,
+            "playlist_id": pl_id,
+            "playlist_result": {
+                "success": pl_res.get("success"),
+                "title": pl_res.get("title"),
+                "total": pl_res.get("total"),
+                "songs_count": len(pl_res.get("songs", []))
+            }
         })
 
     app.router.add_get("/", handle_index)
