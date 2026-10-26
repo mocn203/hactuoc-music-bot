@@ -656,8 +656,21 @@ async def start_web_server():
     async def handle_health(request):
         return web.Response(text="OK", status=200)
 
+    async def handle_debug(request):
+        q = request.query.get("q", "một bước yêu vạn dặm đau")
+        sid = request.query.get("id", "B4Dxqgg21UI")
+        s_res = await zing_engine._call_node("search", q)
+        st_res = await zing_engine._call_node("stream", sid)
+        return web.json_response({
+            "query": q,
+            "search_result": s_res,
+            "stream_id": sid,
+            "stream_result": st_res
+        })
+
     app.router.add_get("/", handle_index)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/debug", handle_debug)
 
     runner = web.AppRunner(app)
     await runner.setup()
