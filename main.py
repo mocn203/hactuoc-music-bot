@@ -20,9 +20,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
-if not TOKEN:
-    logger.error("THIẾU BIẾN MÔI TRƯỜNG DISCORD_TOKEN! Vui lòng cấu hình DISCORD_TOKEN trong Render Environment Variables.")
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -224,7 +221,6 @@ async def cmd_play(ctx: commands.Context, *, query: Optional[str] = None):
     # 1. Trích xuất ID nếu là link Zing MP3, ngược lại search
     song_id = None
     if "zingmp3.vn" in query:
-        # Pattern link Zing: https://zingmp3.vn/bai-hat/.../ID.html
         import re
         match = re.search(r"/([A-Za-z0-9]+)\.html", query)
         if match:
@@ -398,7 +394,7 @@ async def start_web_server():
             "status": "online",
             "bot": "HacTuoc Music Bot",
             "source": "Zing MP3 Engine",
-            "guilds": len(bot.guilds),
+            "guilds": len(bot.guilds) if bot.is_ready() else 0,
             "ping_ms": round(bot.latency * 1000, 2) if bot.is_ready() else 0,
             "timestamp": datetime.datetime.now().isoformat()
         })
@@ -414,12 +410,32 @@ async def start_web_server():
     await site.start()
     logger.info(f"Render Web Server started on http://0.0.0.0:{PORT} (Health Check Active)")
 
+async def run_discord_bot():
+    while True:
+        try:
+            logger.info("Đang đăng nhập vào Discord Gateway...")
+            await bot.start(TOKEN)
+        except discord.HTTPException as e:
+            if e.status == 429:
+                logger.warning("Discord API 429 Rate Limit (chờ 25s trước khi thử lại)...")
+                await asyncio.sleep(25)
+            else:
+                logger.error(f"Lỗi Discord HTTP: {e}. Thử lại sau 15s...")
+                await asyncio.sleep(15)
+        except Exception as e:
+            logger.error(f"Lỗi kết nối bot: {e}. Thử lại sau 15s...")
+            await asyncio.sleep(15)
+
 async def main_runner():
     await start_web_server()
     if TOKEN:
-        await bot.start(TOKEN)
+        asyncio.create_task(run_discord_bot())
+        while True:
+            await asyncio.sleep(3600)
     else:
-        logger.error("Không có TOKEN để khởi động Discord Bot.")
+        logger.error("THIẾU DISCORD_TOKEN! Vui lòng kiểm tra biến môi trường.")
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main_runner())
