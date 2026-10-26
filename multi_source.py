@@ -84,7 +84,7 @@ class MultiSourceEngine:
         self.MAX_CACHE_ENTRIES = 300
         self.last_error: str = ""
 
-        # High-resilience yt-dlp config with YouTube bot bypass (android/ios player clients)
+        # High-resilience yt-dlp config with YouTube bot bypass (visionos/android player clients)
         self.ytdl_base_opts = {
             "format": "bestaudio/best",
             "noplaylist": True,
@@ -94,7 +94,7 @@ class MultiSourceEngine:
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios"]
+                    "player_client": ["visionos", "android"]
                 }
             }
         }
@@ -107,7 +107,7 @@ class MultiSourceEngine:
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios"]
+                    "player_client": ["visionos", "android"]
                 }
             }
         }
