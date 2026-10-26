@@ -155,7 +155,9 @@ class MultiSourceEngine:
         if not stream_url:
             return None
 
+        is_live = bool(entry.get("is_live"))
         duration = int(entry.get("duration") or 0)
+        duration_str = "🔴 Live Stream" if is_live else format_duration(duration)
         webpage_url = entry.get("webpage_url") or entry.get("original_url") or clean_q
         song_data = {
             "id": entry.get("id", ""),
@@ -164,7 +166,7 @@ class MultiSourceEngine:
             "thumbnail": entry.get("thumbnail", ""),
             "streamUrl": stream_url,
             "duration": duration,
-            "durationStr": format_duration(duration),
+            "durationStr": duration_str,
             "source_type": "youtube",
             "webpage_url": webpage_url,
             "resolved_at": now
@@ -354,12 +356,12 @@ class MultiSourceEngine:
             song = await self.resolve_youtube(query_or_url, requester)
             return song
 
-    async def refresh_stream_url(self, song: Song) -> str:
-        """Anti-Stuttering Refresh: Ensures YouTube/CDN audio URLs are never expired right before playback"""
+    async def refresh_stream_url(self, song: Song, force: bool = False) -> str:
+        """Anti-Stuttering Refresh: Ensures direct audio URLs are never expired right before playback"""
         now = time.time()
-        # YouTube URLs can expire or throttle after 30+ minutes in queue
+        # Refresh YouTube if empty, forced, or older than 60 seconds (prevents CDN token expiry/throttle)
         if song.source_type == "youtube" and song.webpage_url:
-            if not song.stream_url or (now - song.resolved_at > 1800):
+            if not song.stream_url or force or (now - song.resolved_at > 60):
                 logger.info(f"🔄 [Anti-Stutter] Refreshing direct audio stream for: {song.title}")
                 refreshed = await self._extract_ytdl_async(song.webpage_url, is_playlist=False)
                 if refreshed:
@@ -369,12 +371,151 @@ class MultiSourceEngine:
                         song.stream_url = new_url
                         song.resolved_at = now
                         return new_url
-        elif song.source_type == "zing" and self.zing_engine and song.id:
-            if not song.stream_url:
-                res = await self.zing_engine.get_stream(song.id)
-                if res.get("success") and res.get("streamUrl"):
-                    song.stream_url = res["streamUrl"]
+        elif song.source_type == "spotify":
+            if not song.stream_url or force or (now - song.resolved_at > 60):
+                logger.info(f"🔄 [Anti-Stutter] Resolving audio stream for Spotify track: {song.title}")
+                search_q = f"{song.title} {song.artists}"
+                yt_song = await self.resolve_youtube(search_q, song.requester)
+                if yt_song and yt_song.stream_url:
+                    song.stream_url = yt_song.stream_url
+                    song.resolved_at = now
+                    return song.stream_url
+        elif song.source_type == "zing" and song.id:
+            if not song.stream_url or force:
+                if self.zing_engine:
+                    res = await self.zing_engine.get_stream(song.id)
+                    if res.get("success") and res.get("streamUrl"):
+                        song.stream_url = res["streamUrl"]
+                        song.resolved_at = now
+                        return song.stream_url
+                # Seamless fallback to YouTube for VIP songs in playlist
+                logger.info(f"🔄 Zing VIP or no stream for '{song.title}'. Falling back to YouTube stream...")
+                search_q = f"{song.title} {song.artists}"
+                yt_song = await self.resolve_youtube(search_q, song.requester)
+                if yt_song and yt_song.stream_url:
+                    song.stream_url = yt_song.stream_url
                     song.resolved_at = now
                     return song.stream_url
 
         return song.stream_url
+
+    async def resolve_playlist(self, query_or_url: str, requester: discord.Member) -> Tuple[str, List[Song]]:
+        """Multi-Platform Playlist Resolver: Supports YouTube, SoundCloud, Spotify, and Zing MP3"""
+        query_or_url = query_or_url.strip()
+        lower = query_or_url.lower()
+
+        # 1. YouTube Playlist
+        if "youtube.com" in lower or "youtu.be" in lower or "list=" in lower:
+            info = await self._extract_ytdl_async(query_or_url, is_playlist=True)
+            if info:
+                pl_title = info.get("title") or "YouTube Playlist"
+                raw_entries = info.get("entries") or []
+                songs = []
+                for entry in raw_entries:
+                    if not entry:
+                        continue
+                    v_id = entry.get("id") or ""
+                    v_url = entry.get("url") or f"https://www.youtube.com/watch?v={v_id}"
+                    dur = int(entry.get("duration") or 0)
+                    s_data = {
+                        "id": v_id,
+                        "title": entry.get("title", "YouTube Track"),
+                        "artists": entry.get("uploader", "Nghệ sĩ YouTube"),
+                        "thumbnail": entry.get("thumbnail", ""),
+                        "streamUrl": "",  # Lazily refreshed right before play
+                        "duration": dur,
+                        "durationStr": format_duration(dur),
+                        "source_type": "youtube",
+                        "webpage_url": v_url,
+                        "resolved_at": 0
+                    }
+                    songs.append(Song(s_data, requester))
+                return pl_title, songs
+
+        # 2. SoundCloud Playlist / Set
+        if "soundcloud.com" in lower:
+            info = await self._extract_ytdl_async(query_or_url, is_playlist=True)
+            if info:
+                pl_title = info.get("title") or "SoundCloud Playlist"
+                raw_entries = info.get("entries") or []
+                songs = []
+                for entry in raw_entries:
+                    if not entry:
+                        continue
+                    v_id = entry.get("id") or ""
+                    v_url = entry.get("url") or entry.get("webpage_url") or query_or_url
+                    dur = int(entry.get("duration") or 0)
+                    s_data = {
+                        "id": str(v_id),
+                        "title": entry.get("title", "SoundCloud Track"),
+                        "artists": entry.get("uploader", "Nghệ sĩ SoundCloud"),
+                        "thumbnail": entry.get("thumbnail", ""),
+                        "streamUrl": "",
+                        "duration": dur,
+                        "durationStr": format_duration(dur),
+                        "source_type": "soundcloud",
+                        "webpage_url": v_url,
+                        "resolved_at": 0
+                    }
+                    songs.append(Song(s_data, requester))
+                return pl_title, songs
+
+        # 3. Spotify Album or Playlist
+        if "open.spotify.com" in lower:
+            loop = asyncio.get_running_loop()
+            def _extract_spotify_playlist():
+                clean_url = query_or_url.split("?")[0]
+                m = re.search(r"open\.spotify\.com/(album|playlist)/([a-zA-Z0-9]+)", clean_url)
+                if not m:
+                    return None, []
+                kind, sp_id = m.group(1), m.group(2)
+                embed_url = f"https://open.spotify.com/embed/{kind}/{sp_id}"
+                req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                try:
+                    with urllib.request.urlopen(req, timeout=8.0) as resp:
+                        html = resp.read().decode("utf-8", errors="ignore")
+                    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
+                    if match:
+                        data = json.loads(match.group(1))
+                        entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+                        title = entity.get("title") or entity.get("name") or f"Spotify {kind.capitalize()}"
+                        track_list = entity.get("trackList", [])
+                        return title, track_list
+                except Exception as e:
+                    logger.error(f"Error fetching Spotify embed data: {e}")
+                return None, []
+
+            pl_title, track_list = await loop.run_in_executor(None, _extract_spotify_playlist)
+            if track_list:
+                songs = []
+                for t in track_list:
+                    dur_sec = int((t.get("duration") or 0) / 1000)
+                    s_data = {
+                        "id": t.get("uri", ""),
+                        "title": t.get("title", "Spotify Track"),
+                        "artists": t.get("subtitle", "Nghệ sĩ"),
+                        "thumbnail": "",
+                        "streamUrl": "",  # Lazily resolved right before play
+                        "duration": dur_sec,
+                        "durationStr": format_duration(dur_sec),
+                        "source_type": "spotify",
+                        "webpage_url": f"https://open.spotify.com/track/{t.get('id', '')}" if t.get('id') else query_or_url,
+                        "resolved_at": 0
+                    }
+                    songs.append(Song(s_data, requester))
+                return pl_title or "Spotify Playlist", songs
+
+        # 4. Zing MP3 Album / Playlist
+        if self.zing_engine:
+            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query_or_url)
+            playlist_id = pl_match.group(1) if pl_match else query_or_url
+            pl_data = await self.zing_engine.get_playlist(playlist_id)
+            if pl_data.get("success") and pl_data.get("songs"):
+                pl_title = pl_data.get("title", "Zing MP3 Playlist")
+                songs = []
+                for s in pl_data["songs"]:
+                    s["source_type"] = "zing"
+                    songs.append(Song(s, requester))
+                return pl_title, songs
+
+        return "Không xác định", []

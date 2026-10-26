@@ -211,15 +211,46 @@ class ZingEngine:
 zing_engine = ZingEngine()
 multi_engine = MultiSourceEngine(zing_engine=zing_engine)
 
+import socket
+from discord.http import HTTPClient
+
+def make_tcp_nodelay_socket(addr_info):
+    """Creates low-latency TCP sockets with TCP_NODELAY enabled for Discord Gateway & HTTP"""
+    sock = socket.socket(addr_info[0], addr_info[1], addr_info[2])
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    return sock
+
+_orig_static_login = HTTPClient.static_login
+async def _optimized_static_login(self, token: str):
+    """Ensure aiohttp session uses TCP_NODELAY connector for ultra-low ping Gateway connection"""
+    if getattr(self, "connector", None) is discord.utils.MISSING or self.connector is None:
+        try:
+            import aiohttp
+            self.connector = aiohttp.TCPConnector(limit=0, socket_factory=make_tcp_nodelay_socket)
+            logger.info("⚡ [Network Opt] Initialized aiohttp TCPConnector with TCP_NODELAY")
+        except Exception as e:
+            logger.debug(f"Could not apply custom TCPConnector: {e}")
+    return await _orig_static_login(self, token)
+
+HTTPClient.static_login = _optimized_static_login
+
 def optimize_voice_socket(vc: Optional[discord.VoiceClient]):
     """Sets DSCP Expedited Forwarding (IP_TOS 0xb8 / DSCP 46) on UDP voice socket for jitter-free real-time audio"""
     if not vc:
         return
     try:
-        import socket
-        if hasattr(vc, "socket") and vc.socket:
-            vc.socket.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xb8)
-            logger.debug("Applied DSCP 46 expedited forwarding to voice socket")
+        sock = getattr(vc, "socket", None)
+        if not sock or sock is discord.utils.MISSING:
+            conn = getattr(vc, "_connection", None)
+            if conn:
+                sock = getattr(conn, "socket", None)
+
+        if sock and sock is not discord.utils.MISSING and isinstance(sock, socket.socket):
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xb8)
+            logger.info("⚡ [Voice Opt] Applied DSCP 46 (IP_TOS 0xb8) to UDP voice socket")
     except Exception as e:
         logger.debug(f"Could not apply DSCP socket option: {e}")
 
@@ -272,8 +303,7 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
         "-reconnect_delay_max 5",
         "-reconnect_on_network_error 1",
         "-probesize 64k",
-        "-analyzeduration 0",
-        "-buffer_size 2048k"
+        "-analyzeduration 0"
     ]
     if start_pos_sec > 0:
         before_opts.insert(0, f"-ss {start_pos_sec}")
@@ -624,13 +654,18 @@ class MusicBotInstance:
 
             voice_channel = ctx.author.voice.channel
 
-            # Detect playlist / album URLs (e.g. /(album|playlist)/[^/]+/([A-Za-z0-9]+)\.html)
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
-            if pl_match:
-                searching_msg = await ctx.send("🔍 Đang nạp toàn bộ Album / Playlist từ Zing MP3... Chờ xíu nha 💿")
+            # Detect playlist / album URLs (Zing, YouTube list=, Spotify album/playlist, SoundCloud sets)
+            is_playlist = bool(
+                re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
+                ("youtube.com" in query.lower() and "list=" in query.lower()) or
+                ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
+                ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
+            )
+            if is_playlist:
+                searching_msg = await ctx.send("🔍 Đang nạp toàn bộ Album / Playlist... Chờ xíu nha 💿")
                 return await instance.play_playlist_helper(
                     ctx,
-                    pl_match.group(1),
+                    query.strip(),
                     ctx.author,
                     voice_channel,
                     ctx.channel,
@@ -685,22 +720,19 @@ class MusicBotInstance:
 
         @bot.command(name="playlist", aliases=["album", "pl"])
         async def cmd_playlist(ctx: commands.Context, *, query: Optional[str] = None):
-            """Phát toàn bộ Album hoặc Playlist từ Zing MP3"""
+            """Phát toàn bộ Album hoặc Playlist từ YouTube, Zing MP3, Spotify, SoundCloud"""
             prefix = instance.prefixes[0]
             if not query:
-                return await ctx.reply(f"⚠️ Vui lòng nhập link hoặc ID Album / Playlist Zing MP3! (Ví dụ: `{prefix}playlist ZWZB969E`)")
+                return await ctx.reply(f"⚠️ Vui lòng nhập link hoặc ID Album / Playlist! (Ví dụ: `{prefix}playlist <link YouTube / Spotify / Zing MP3>` hoặc ID Zing)")
 
             if not ctx.author.voice or not ctx.author.voice.channel:
                 return await ctx.reply("❌ Bạn phải tham gia vào một phòng Voice trước khi gọi bot phát nhạc nhé!")
 
             voice_channel = ctx.author.voice.channel
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
-            playlist_id = pl_match.group(1) if pl_match else query.strip()
-
-            searching_msg = await ctx.send(f"🔍 Đang nạp toàn bộ Album / Playlist **{playlist_id}**... Chờ xíu nha 💿")
+            searching_msg = await ctx.send(f"🔍 Đang nạp toàn bộ Album / Playlist **{query.strip()}**... Chờ xíu nha 💿")
             await instance.play_playlist_helper(
                 ctx,
-                playlist_id,
+                query.strip(),
                 ctx.author,
                 voice_channel,
                 ctx.channel,
@@ -1109,11 +1141,17 @@ class MusicBotInstance:
             await interaction.response.defer()
             voice_channel = member.voice.channel
 
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
-            if pl_match:
+            # Detect playlist / album URLs (Zing, YouTube list=, Spotify album/playlist, SoundCloud sets)
+            is_playlist = bool(
+                re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
+                ("youtube.com" in query.lower() and "list=" in query.lower()) or
+                ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
+                ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
+            )
+            if is_playlist:
                 return await instance.play_playlist_helper(
                     interaction,
-                    pl_match.group(1),
+                    query.strip(),
                     member,
                     voice_channel,
                     interaction.channel,
@@ -1162,8 +1200,8 @@ class MusicBotInstance:
                 await instance.start_next_song(guild.id)
                 await interaction.followup.send(f"🎶 Đang chuẩn bị phát: **{song.title}** - `{song.artists}` ({song.platform_badge})")
 
-        @bot.tree.command(name="playlist", description="💿 Phát toàn bộ Album hoặc Playlist từ Zing MP3")
-        @app_commands.describe(query="Link hoặc ID Album/Playlist Zing MP3")
+        @bot.tree.command(name="playlist", description="💿 Phát toàn bộ Album hoặc Playlist từ YouTube, Zing MP3, Spotify, SoundCloud")
+        @app_commands.describe(query="Link hoặc ID Album/Playlist (YouTube / Zing MP3 / Spotify / SoundCloud)")
         async def slash_playlist(interaction: discord.Interaction, query: str):
             guild = interaction.guild
             if not guild:
@@ -1174,12 +1212,10 @@ class MusicBotInstance:
 
             await interaction.response.defer()
             voice_channel = member.voice.channel
-            pl_match = re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query)
-            playlist_id = pl_match.group(1) if pl_match else query.strip()
 
             await instance.play_playlist_helper(
                 interaction,
-                playlist_id,
+                query.strip(),
                 member,
                 voice_channel,
                 interaction.channel,
@@ -1285,7 +1321,7 @@ class MusicBotInstance:
             while player.queue:
                 candidate = player.queue.pop(0)
                 # Anti-Stutter refresh right before playback
-                candidate.stream_url = await multi_engine.refresh_stream_url(candidate)
+                candidate.stream_url = await multi_engine.refresh_stream_url(candidate, force=True)
                 if not candidate.stream_url:
                     if player.text_channel:
                         await player.text_channel.send(f"⚠️ Bỏ qua `{candidate.title}` (không có luồng phát khả dụng).")
@@ -1388,9 +1424,9 @@ class MusicBotInstance:
             await vc.move_to(voice_channel)
             optimize_voice_socket(vc)
 
-        pl_data = await zing_engine.get_playlist(playlist_id)
-        if not pl_data.get("success") or not pl_data.get("songs"):
-            err_text = f"❌ {pl_data.get('error', 'Không tìm thấy Album / Playlist trên Zing MP3 hoặc danh sách trống!')}"
+        pl_title, song_objs = await multi_engine.resolve_playlist(playlist_id, user)
+        if not song_objs:
+            err_text = "❌ Không tìm thấy Album / Playlist hoặc danh sách bài hát trống! (Hỗ trợ Zing MP3, YouTube, SoundCloud, Spotify)"
             if searching_msg:
                 return await searching_msg.edit(content=err_text)
             elif is_slash:
@@ -1398,42 +1434,17 @@ class MusicBotInstance:
             else:
                 return await ctx_or_interaction.reply(err_text)
 
-        raw_songs = pl_data["songs"]
-        pl_title = pl_data.get("title", "Album / Playlist")
-        pl_thumb = pl_data.get("thumbnail", "")
-        song_objs = [Song(s, user) for s in raw_songs]
-
         player = self.get_player(guild.id)
         player.text_channel = channel
 
         is_idle = not vc.is_playing() and not vc.is_paused()
+        actual_count = len(song_objs)
 
         if is_idle:
-            first_song = None
-            while song_objs:
-                candidate = song_objs[0]
-                st_res = await zing_engine.get_stream(candidate.id)
-                if st_res.get("success") and st_res.get("streamUrl"):
-                    candidate.stream_url = st_res["streamUrl"]
-                    first_song = candidate
-                    break
-                else:
-                    song_objs.pop(0)
-
-            if not first_song:
-                err_text = "❌ Tất cả bài hát trong Album/Playlist này đều thuộc diện VIP hoặc không có luồng phát miễn phí!"
-                if searching_msg:
-                    return await searching_msg.edit(content=err_text)
-                elif is_slash:
-                    return await ctx_or_interaction.followup.send(err_text)
-                else:
-                    return await ctx_or_interaction.reply(err_text)
-
-            actual_count = len(song_objs)
             queue_pos_desc = f"▶️ Đang phát bài 1 (`#1` đến `#{actual_count}`)" if actual_count > 1 else "▶️ Đang phát ngay"
             player.queue.extend(song_objs)
+            asyncio.create_task(self.start_next_song(guild.id))
         else:
-            actual_count = len(song_objs)
             start_pos = len(player.queue) + 1
             end_pos = len(player.queue) + actual_count
             queue_pos_desc = f"`#{start_pos}` đến `#{end_pos}`"
@@ -1450,9 +1461,7 @@ class MusicBotInstance:
             ),
             color=self.embed_color
         )
-        if pl_thumb:
-            embed.set_thumbnail(url=pl_thumb)
-        embed.set_footer(text=f"Zing MP3 Opus Engine • {self.name} • {self.prefixes[0]}pl 🎶")
+        embed.set_footer(text=f"Multi-Source Zero-Stutter Engine • {self.name} • {self.prefixes[0]}pl 🎶")
 
         if searching_msg:
             try:
