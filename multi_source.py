@@ -82,6 +82,7 @@ class MultiSourceEngine:
         self.cache: Dict[str, Dict[str, Any]] = {}
         self.CACHE_TTL = 3600  # 1 hour cache
         self.MAX_CACHE_ENTRIES = 300
+        self.last_error: str = ""
 
         # High-resilience yt-dlp config with YouTube bot bypass (android/ios player clients)
         self.ytdl_base_opts = {
@@ -150,11 +151,13 @@ class MultiSourceEngine:
                 return ydl.extract_info(query_or_url, download=False)
 
         try:
-            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=15.0)
+            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=25.0)
         except asyncio.TimeoutError:
-            logger.error(f"yt-dlp extraction timed out for '{query_or_url}'")
+            self.last_error = f"TimeoutError: yt-dlp extraction timed out after 25s for '{query_or_url}'"
+            logger.error(self.last_error)
             return None
         except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             logger.error(f"yt-dlp extraction error for '{query_or_url}': {e}")
             return None
 

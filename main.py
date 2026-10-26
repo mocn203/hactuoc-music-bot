@@ -1643,8 +1643,8 @@ async def start_web_server():
                 "total": pl_res.get("total"),
                 "songs_count": len(pl_res.get("songs", []))
             },
-            "yt_probe": yt_probe,
-            "sp_probe": sp_probe
+            "yt_probe": yt_probe or ({"error": multi_engine.last_error} if yt_q else None),
+            "sp_probe": sp_probe or ({"error": multi_engine.last_error} if sp_q else None)
         })
 
     app.router.add_get("/", handle_index)
