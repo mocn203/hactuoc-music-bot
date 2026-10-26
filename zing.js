@@ -1,3 +1,20 @@
+const axios = require("axios");
+
+// Patch axios to spoof Vietnamese IP headers for Zing MP3 API
+const origCreate = axios.create;
+axios.create = function(config) {
+  const instance = origCreate.call(axios, config);
+  instance.interceptors.request.use(req => {
+    req.headers["X-Forwarded-For"] = "14.161.35.12"; // Viettel VN IP
+    req.headers["X-Real-IP"] = "14.161.35.12";
+    req.headers["Client-IP"] = "14.161.35.12";
+    req.headers["CF-Connecting-IP"] = "14.161.35.12";
+    req.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+    return req;
+  });
+  return instance;
+};
+
 const { ZingMp3 } = require("zingmp3-api-full");
 
 function formatDuration(sec) {
