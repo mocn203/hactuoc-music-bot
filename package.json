@@ -1,0 +1,9 @@
+{
+  "name": "hactuoc-music-bot",
+  "version": "1.0.0",
+  "description": "Zing MP3 Discord Music Bot for HacTuoc School 24/7 on Render",
+  "main": "zing.js",
+  "dependencies": {
+    "zingmp3-api-full": "^1.0.14"
+  }
+}
