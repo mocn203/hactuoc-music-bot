@@ -37,7 +37,11 @@ async function main() {
 
       const streamUrl = streamRes?.data?.["128"] || streamRes?.data?.["320"];
       if (!streamUrl || streamUrl === "VIP") {
-        console.log(JSON.stringify({ error: "Bài hát này thuộc diện VIP hoặc không có luồng phát miễn phí" }));
+        console.log(JSON.stringify({ 
+          error: "Bài hát này thuộc diện VIP hoặc không có luồng phát miễn phí",
+          rawStream: streamRes,
+          rawInfo: infoRes
+        }));
         return;
       }
 
