@@ -212,30 +212,15 @@ zing_engine = ZingEngine()
 multi_engine = MultiSourceEngine(zing_engine=zing_engine)
 
 import socket
-from discord.http import HTTPClient
 
 def make_tcp_nodelay_socket(addr_info):
-    """Creates low-latency TCP sockets with TCP_NODELAY enabled for Discord Gateway & HTTP"""
+    """Creates low-latency TCP sockets with TCP_NODELAY enabled"""
     sock = socket.socket(addr_info[0], addr_info[1], addr_info[2])
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception:
         pass
     return sock
-
-_orig_static_login = HTTPClient.static_login
-async def _optimized_static_login(self, token: str):
-    """Ensure aiohttp session uses TCP_NODELAY connector for ultra-low ping Gateway connection"""
-    if getattr(self, "connector", None) is discord.utils.MISSING or self.connector is None:
-        try:
-            import aiohttp
-            self.connector = aiohttp.TCPConnector(limit=0, socket_factory=make_tcp_nodelay_socket)
-            logger.info("⚡ [Network Opt] Initialized aiohttp TCPConnector with TCP_NODELAY")
-        except Exception as e:
-            logger.debug(f"Could not apply custom TCPConnector: {e}")
-    return await _orig_static_login(self, token)
-
-HTTPClient.static_login = _optimized_static_login
 
 def optimize_voice_socket(vc: Optional[discord.VoiceClient]):
     """Sets DSCP Expedited Forwarding (IP_TOS 0xb8 / DSCP 46) on UDP voice socket for jitter-free real-time audio"""
