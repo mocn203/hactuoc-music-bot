@@ -278,27 +278,31 @@ BOOST_PROFILES: Dict[str, Dict[str, str]] = {
 
 def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: int = 0) -> discord.AudioSource:
     """Creates a high-performance direct Opus audio source with anti-jitter 2048KB buffer & EQ boost.
-    Bypasses Python PCM transcoding overhead, dropping CPU usage and delivering sub-5ms Opus packets."""
+    Explicit 48kHz stereo resampling and frame duration ensures exactly 1.0x native playback speed."""
     boost_cfg = BOOST_PROFILES.get(boost_level, BOOST_PROFILES["off"])
     audio_filter = boost_cfg["filter"]
+
+    # Explicit 48kHz stereo resampling before EQ boost guarantees exact 1.0x speed across all formats (44.1k, 32k, 48k)
+    combined_filter = f"aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,{audio_filter}"
 
     before_opts = [
         "-reconnect 1",
         "-reconnect_streamed 1",
         "-reconnect_delay_max 5",
         "-reconnect_on_network_error 1",
-        "-probesize 64k",
-        "-analyzeduration 0"
+        "-probesize 128k",
+        "-analyzeduration 100000"
     ]
     if start_pos_sec > 0:
         before_opts.insert(0, f"-ss {start_pos_sec}")
 
     before_options = " ".join(before_opts)
 
-    # Opus Native: direct libopus encoding at 128k VBR with sub-5ms packet emission & anti-jitter 2048k buffer
+    # Opus Native: 48kHz stereo, exact 20ms frame duration, 128k VBR
     options = (
         f'-vn '
-        f'-filter:a "{audio_filter}" '
+        f'-filter:a "{combined_filter}" '
+        f'-frame_duration 20 '
         f'-buffer_size 2048k '
         f'-application audio '
         f'-vbr on '
@@ -315,7 +319,7 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
         )
     except Exception as e:
         logger.warning(f"⚠️ FFmpegOpusAudio fallback to PCMAudio due to: {e}")
-        pcm_options = f'-vn -filter:a "{audio_filter}" -buffer_size 2048k'
+        pcm_options = f'-vn -filter:a "{combined_filter}" -buffer_size 2048k'
         return discord.FFmpegPCMAudio(
             stream_url,
             before_options=before_options,
@@ -1587,6 +1591,7 @@ async def start_web_server():
         sid = request.query.get("id", "B4Dxqgg21UI")
         pl_id = request.query.get("pl", "ZWZB969E")
         yt_q = request.query.get("yt")
+        sp_q = request.query.get("sp")
 
         s_res = await zing_engine._call_node("search", q)
         st_res = await zing_engine._call_node("stream", sid)
@@ -1594,14 +1599,35 @@ async def start_web_server():
 
         yt_probe = None
         if yt_q:
-            info = await multi_engine._extract_ytdl_async(f"ytsearch1:{yt_q}", is_playlist=False)
+            clean_yt = yt_q.strip()
+            is_url = bool(re.match(r"^https?://", clean_yt))
+            target = clean_yt if is_url else f"ytsearch1:{clean_yt}"
+            info = await multi_engine._extract_ytdl_async(target, is_playlist=False)
             if info:
                 entry = info["entries"][0] if "entries" in info and info["entries"] else info
                 yt_probe = {
                     "title": entry.get("title"),
                     "uploader": entry.get("uploader"),
                     "duration": entry.get("duration"),
-                    "has_url": bool(entry.get("url"))
+                    "has_url": bool(entry.get("url")),
+                    "url": entry.get("url")[:80] if entry.get("url") else None
+                }
+
+        sp_probe = None
+        if sp_q:
+            # Fake mock member for debug probe
+            from unittest.mock import MagicMock
+            mock_member = MagicMock()
+            mock_member.mention = "@DebugUser"
+            song = await multi_engine.resolve_spotify(sp_q.strip(), mock_member)
+            if song:
+                sp_probe = {
+                    "title": song.title,
+                    "artists": song.artists,
+                    "duration": song.duration_sec,
+                    "source_type": song.source_type,
+                    "has_url": bool(song.stream_url),
+                    "stream_url": song.stream_url[:80] if song.stream_url else None
                 }
 
         return web.json_response({
@@ -1617,7 +1643,8 @@ async def start_web_server():
                 "total": pl_res.get("total"),
                 "songs_count": len(pl_res.get("songs", []))
             },
-            "yt_probe": yt_probe
+            "yt_probe": yt_probe,
+            "sp_probe": sp_probe
         })
 
     app.router.add_get("/", handle_index)

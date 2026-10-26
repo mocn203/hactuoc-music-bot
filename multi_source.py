@@ -6,6 +6,7 @@ import json
 import asyncio
 import logging
 import urllib.request
+import html
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -20,6 +21,30 @@ def format_duration(sec: int) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+def build_spotify_search_query(title: str, artists: List[str]) -> str:
+    """Build a search-engine friendly YouTube query from Spotify metadata without nested quotes or noise"""
+    clean_title = html.unescape(title or "")
+    clean_title = re.sub(r'["\'`]', '', clean_title)
+    
+    # Extract feature artists inside title e.g. "(feat. ...)" or "(ft. ...)"
+    m_feat = re.search(r'\((?:feat|ft)\.?\s*([^)]+)\)', clean_title, flags=re.I)
+    feat_artists = m_feat.group(1) if m_feat else ''
+    core_title = re.sub(r'\((?:feat|ft)\.?\s*[^)]+\)', '', clean_title, flags=re.I).strip()
+    
+    clean_artists = []
+    for a in artists:
+        a_clean = html.unescape(a or "")
+        a_clean = re.sub(r'["\'`]', '', a_clean).strip()
+        if a_clean and a_clean.lower() not in core_title.lower():
+            clean_artists.append(a_clean)
+            
+    top_artists = clean_artists[:2]
+    if not top_artists and feat_artists:
+        top_artists = [feat_artists.split(',')[0].strip()]
+        
+    query = f"{core_title} {' '.join(top_artists)}".strip()
+    return re.sub(r'\s+', ' ', query)
 
 class Song:
     """Universal Song model supporting Zing MP3, YouTube, SoundCloud, Spotify, and Direct Streams"""
@@ -58,29 +83,30 @@ class MultiSourceEngine:
         self.CACHE_TTL = 3600  # 1 hour cache
         self.MAX_CACHE_ENTRIES = 300
 
-        # High-resilience yt-dlp config with YouTube bot bypass (android/web player clients)
+        # High-resilience yt-dlp config with YouTube bot bypass (android/ios player clients)
         self.ytdl_base_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": "bestaudio/best",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "source_address": "0.0.0.0",
             "default_search": "ytsearch",
+            "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "web"]
+                    "player_client": ["android", "ios"]
                 }
             }
         }
 
         self.ytdl_playlist_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": "bestaudio/best",
             "extract_flat": True,
             "quiet": True,
             "no_warnings": True,
+            "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "web"]
+                    "player_client": ["android", "ios"]
                 }
             }
         }
@@ -223,79 +249,113 @@ class MultiSourceEngine:
 
     async def resolve_spotify(self, url: str, requester: discord.Member) -> Optional[Song]:
         """Convert Spotify track URL to metadata, then resolve stream via YouTube/Zing"""
-        clean_url = url.strip()
+        clean_url = url.split("?")[0].strip()
         loop = asyncio.get_running_loop()
 
-        def _fetch_spotify_metadata() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-            try:
-                # 1. Try public Spotify oEmbed API
-                oembed_url = f"https://open.spotify.com/oembed?url={clean_url}"
-                req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=6.0) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    title = data.get("title")
-                    thumb = data.get("thumbnail_url")
-            except Exception:
-                title, thumb = None, None
+        def _fetch_spotify_metadata() -> Tuple[Optional[str], List[str], Optional[str], int]:
+            title, artists, thumb, duration_sec = None, [], None, 0
+            m_tr = re.search(r"open\.spotify\.com/track/([a-zA-Z0-9]+)", clean_url)
+            
+            # 1. Primary: Spotify Embed JSON (most complete & reliable structured metadata)
+            if m_tr:
+                track_id = m_tr.group(1)
+                embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+                try:
+                    req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        text = resp.read().decode("utf-8", errors="ignore")
+                    m_data = re.search(r'<script id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', text, flags=re.DOTALL)
+                    if m_data:
+                        d = json.loads(m_data.group(1))
+                        ent = d.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+                        if ent:
+                            title = ent.get("name")
+                            artists = [a.get("name") for a in ent.get("artists", []) if a.get("name")]
+                            dur_ms = ent.get("duration", 0)
+                            if dur_ms:
+                                duration_sec = int(dur_ms / 1000)
+                            visuals = ent.get("visualIdentity", {}).get("image", [])
+                            if visuals:
+                                thumb = visuals[0].get("url")
+                except Exception as e:
+                    logger.debug(f"Spotify Embed fetch error: {e}")
 
-            # 2. Try HTML meta tags to get artist
-            artist = None
-            try:
-                req_html = urllib.request.Request(clean_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-                with urllib.request.urlopen(req_html, timeout=6.0) as resp:
-                    html = resp.read().decode("utf-8", errors="ignore")
+            # 2. Secondary fallback: Spotify oEmbed API
+            if not title:
+                try:
+                    oembed_url = f"https://open.spotify.com/oembed?url={clean_url}"
+                    req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        title = data.get("title")
+                        thumb = data.get("thumbnail_url")
+                except Exception as e:
+                    logger.debug(f"Spotify oEmbed error: {e}")
+
+            # 3. Tertiary fallback: OpenGraph HTML meta tags
+            if not title or not artists:
+                try:
+                    req_html = urllib.request.Request(clean_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                    with urllib.request.urlopen(req_html, timeout=6.0) as resp:
+                        html_text = resp.read().decode("utf-8", errors="ignore")
                     if not title:
-                        tm = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+                        tm = re.search(r'<meta property="og:title" content="([^"]+)"', html_text)
                         if tm:
                             title = tm.group(1)
                     if not thumb:
-                        im = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+                        im = re.search(r'<meta property="og:image" content="([^"]+)"', html_text)
                         if im:
                             thumb = im.group(1)
-                    dm = re.search(r'<meta property="og:description" content="([^"]+)"', html)
-                    if dm:
-                        desc = dm.group(1)
-                        # e.g. "Rick Astley · Whenever You Need Somebody · Song · 1987"
-                        parts = [p.strip() for p in desc.split("·")]
-                        if parts:
-                            artist = parts[0]
-            except Exception as e:
-                logger.debug(f"Spotify HTML parse error: {e}")
+                    if not artists:
+                        dm = re.search(r'<meta property="og:description" content="([^"]+)"', html_text)
+                        if dm:
+                            desc = dm.group(1)
+                            parts = [p.strip() for p in desc.split("·")]
+                            if parts:
+                                artists = [parts[0]]
+                except Exception as e:
+                    logger.debug(f"Spotify HTML parse error: {e}")
 
-            return title, artist, thumb
+            if not title:
+                return None, [], None, 0
 
-        title, artist, thumb = await loop.run_in_executor(None, _fetch_spotify_metadata)
+            title = html.unescape(title)
+            artists = [html.unescape(a) for a in artists]
+            return title, artists, thumb, duration_sec
+
+        title, artists, thumb, duration_sec = await loop.run_in_executor(None, _fetch_spotify_metadata)
         if not title:
             logger.warning(f"Could not extract Spotify metadata from '{clean_url}'")
             return None
 
-        search_query = f"{title} {artist}" if artist else title
-        logger.info(f"🟢 Spotify resolved: '{title}' - '{artist}'. Searching audio stream...")
+        artist_str = ", ".join(artists) if artists else "Nghệ sĩ Spotify"
+        search_query = build_spotify_search_query(title, artists)
+        logger.info(f"🟢 Spotify resolved: '{title}' - '{artist_str}'. Searching query: '{search_query}'...")
 
         # Resolve stream via YouTube
         song = await self.resolve_youtube(search_query, requester)
+        if not song and search_query != title:
+            # Fallback to pure title search if compound search had 0 results
+            song = await self.resolve_youtube(title, requester)
+
+        # Fallback to Zing if YouTube fails
+        if not song and self.zing_engine:
+            song = await self.zing_engine.resolve_song(search_query, requester)
+            if not song and search_query != title:
+                song = await self.zing_engine.resolve_song(title, requester)
+
         if song:
             song.title = title
-            if artist:
-                song.artists = artist
+            if artists:
+                song.artists = artist_str
             if thumb:
                 song.thumbnail = thumb
+            if duration_sec > 0:
+                song.duration_sec = duration_sec
+                song.duration_str = format_duration(duration_sec)
             song.source_type = "spotify"
             song.webpage_url = clean_url
             return song
-
-        # Fallback to Zing if available
-        if self.zing_engine:
-            song = await self.zing_engine.resolve_song(search_query, requester)
-            if song:
-                song.title = title
-                if artist:
-                    song.artists = artist
-                if thumb:
-                    song.thumbnail = thumb
-                song.source_type = "spotify"
-                song.webpage_url = clean_url
-                return song
 
         return None
 
@@ -374,8 +434,10 @@ class MultiSourceEngine:
         elif song.source_type == "spotify":
             if not song.stream_url or force or (now - song.resolved_at > 60):
                 logger.info(f"🔄 [Anti-Stutter] Resolving audio stream for Spotify track: {song.title}")
-                search_q = f"{song.title} {song.artists}"
+                search_q = build_spotify_search_query(song.title, [song.artists]) if song.artists else song.title
                 yt_song = await self.resolve_youtube(search_q, song.requester)
+                if not yt_song and search_q != song.title:
+                    yt_song = await self.resolve_youtube(song.title, song.requester)
                 if yt_song and yt_song.stream_url:
                     song.stream_url = yt_song.stream_url
                     song.resolved_at = now
