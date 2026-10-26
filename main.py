@@ -301,6 +301,8 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
     # Opus Native: 48kHz stereo, exact 20ms frame duration, 128k VBR
     options = (
         f'-vn '
+        f'-ar 48000 '
+        f'-ac 2 '
         f'-filter:a "{combined_filter}" '
         f'-frame_duration 20 '
         f'-buffer_size 2048k '
@@ -319,7 +321,7 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
         )
     except Exception as e:
         logger.warning(f"⚠️ FFmpegOpusAudio fallback to PCMAudio due to: {e}")
-        pcm_options = f'-vn -filter:a "{combined_filter}" -buffer_size 2048k'
+        pcm_options = f'-vn -ar 48000 -ac 2 -filter:a "{combined_filter}" -buffer_size 2048k'
         return discord.FFmpegPCMAudio(
             stream_url,
             before_options=before_options,
@@ -644,12 +646,17 @@ class MusicBotInstance:
             voice_channel = ctx.author.voice.channel
 
             # Detect playlist / album URLs (Zing, YouTube list=, Spotify album/playlist, SoundCloud sets)
-            is_playlist = bool(
-                re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
-                ("youtube.com" in query.lower() and "list=" in query.lower()) or
-                ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
-                ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
-            )
+            is_mix_or_single_video = bool(re.search(r"watch\?.*v=[a-zA-Z0-9_-]{11}", query) and re.search(r"list=(?:RD|LL|WL)", query))
+            if is_mix_or_single_video:
+                is_playlist = False
+                query = re.sub(r"&list=[^&]+", "", query)
+            else:
+                is_playlist = bool(
+                    re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
+                    ("youtube.com" in query.lower() and "list=" in query.lower()) or
+                    ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
+                    ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
+                )
             if is_playlist:
                 searching_msg = await ctx.send("🔍 Đang nạp toàn bộ Album / Playlist... Chờ xíu nha 💿")
                 return await instance.play_playlist_helper(
@@ -1131,12 +1138,17 @@ class MusicBotInstance:
             voice_channel = member.voice.channel
 
             # Detect playlist / album URLs (Zing, YouTube list=, Spotify album/playlist, SoundCloud sets)
-            is_playlist = bool(
-                re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
-                ("youtube.com" in query.lower() and "list=" in query.lower()) or
-                ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
-                ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
-            )
+            is_mix_or_single_video = bool(re.search(r"watch\?.*v=[a-zA-Z0-9_-]{11}", query) and re.search(r"list=(?:RD|LL|WL)", query))
+            if is_mix_or_single_video:
+                is_playlist = False
+                query = re.sub(r"&list=[^&]+", "", query)
+            else:
+                is_playlist = bool(
+                    re.search(r"/(?:album|playlist)/(?:[^/]+/)?([A-Za-z0-9]+)(?:\.html)?", query) or
+                    ("youtube.com" in query.lower() and "list=" in query.lower()) or
+                    ("open.spotify.com" in query.lower() and ("/album/" in query.lower() or "/playlist/" in query.lower())) or
+                    ("soundcloud.com" in query.lower() and "/sets/" in query.lower())
+                )
             if is_playlist:
                 return await instance.play_playlist_helper(
                     interaction,

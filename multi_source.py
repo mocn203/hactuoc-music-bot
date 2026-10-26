@@ -22,16 +22,60 @@ def format_duration(sec: int) -> str:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
+def extract_youtube_id(url_or_id: str) -> Optional[str]:
+    """Extract standard 11-char YouTube video ID from any format (short link, watch URL, embed, shorts, raw ID)"""
+    s = url_or_id.strip()
+    if re.match(r"^[a-zA-Z0-9_-]{11}$", s):
+        return s
+    m = re.search(r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})", s)
+    if m:
+        return m.group(1)
+    m_v = re.search(r"[?&]v=([a-zA-Z0-9_-]{11})", s)
+    if m_v:
+        return m_v.group(1)
+    return None
+
+def get_canonical_youtube_url(url_or_id: str) -> str:
+    """Return clean canonical YouTube watch URL for oEmbed and extraction"""
+    vid = extract_youtube_id(url_or_id)
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    return url_or_id.strip()
+
+def clean_music_title(title: str) -> str:
+    """Clean video noise from YouTube titles to optimize search hit rate on Zing MP3 and SoundCloud"""
+    s = html.unescape(title or "")
+    s = re.sub(r'["\'`]', '', s)
+    noise_patterns = [
+        r'[\(\[](?:Official\s+)?(?:Music\s+Video|MV|Lyric\s+Video|Audio|Visualizer|Teaser|Trailer|Video\s+Lyrics?|Live\s+Session|Performance)[\)\]]',
+        r'[\(\[](?:Vietsub|Karaoke|Cover|Parody|Full\s+Audio|HD|4K|HQ|Remastered)[\)\]]',
+        r'\|\s*(?:OFFICIAL\s+)?(?:MUSIC\s+VIDEO|MV|AUDIO|LYRICS?).*$',
+        r'/\s*(?:OFFICIAL\s+)?(?:MUSIC\s+VIDEO|MV).*$',
+        r'-\s*(?:OFFICIAL\s+)?(?:MUSIC\s+VIDEO|MV).*$',
+        r'\(prod\.?\s+by\s+[^)]+\)',
+        r'\[prod\.?\s+by\s+[^\]]+\]',
+    ]
+    for p in noise_patterns:
+        s = re.sub(p, '', s, flags=re.IGNORECASE)
+    # Convert pipes to spaces for friendly text search
+    s = re.sub(r'\s*\|\s*', ' ', s)
+    s = re.sub(r'[\s\|\-/]+$', '', s).strip()
+    return re.sub(r'\s+', ' ', s)
+
 def build_spotify_search_query(title: str, artists: List[str]) -> str:
     """Build a search-engine friendly YouTube query from Spotify metadata without nested quotes or noise"""
     clean_title = html.unescape(title or "")
     clean_title = re.sub(r'["\'`]', '', clean_title)
     
-    # Extract feature artists inside title e.g. "(feat. ...)" or "(ft. ...)"
-    m_feat = re.search(r'\((?:feat|ft)\.?\s*([^)]+)\)', clean_title, flags=re.I)
+    # Extract feature artists inside title e.g. "(feat. ...)", "[feat. ...]", "(with ...)"
+    m_feat = re.search(r'[\(\[](?:feat|ft|with)\.?\s*([^\]\)]+)[\)\]]', clean_title, flags=re.I)
     feat_artists = m_feat.group(1) if m_feat else ''
-    core_title = re.sub(r'\((?:feat|ft)\.?\s*[^)]+\)', '', clean_title, flags=re.I).strip()
+    core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?\s*[^\]\)]+[\)\]]', '', clean_title, flags=re.I).strip()
     
+    # Strip remastered / official / live suffixes
+    core_title = re.sub(r'\s*-\s*(?:Remastered|Live|Mono|Stereo|Deluxe).*$', '', core_title, flags=re.I).strip()
+    core_title = re.sub(r'[\(\[](?:Remastered|Live|Official|Audio|Bonus Track)[^\)\]]*[\)\]]', '', core_title, flags=re.I).strip()
+
     clean_artists = []
     for a in artists:
         a_clean = html.unescape(a or "")
@@ -41,7 +85,7 @@ def build_spotify_search_query(title: str, artists: List[str]) -> str:
             
     top_artists = clean_artists[:2]
     if not top_artists and feat_artists:
-        top_artists = [feat_artists.split(',')[0].strip()]
+        top_artists = [re.split(r'[,&]', feat_artists)[0].strip()]
         
     query = f"{core_title} {' '.join(top_artists)}".strip()
     return re.sub(r'\s+', ' ', query)
@@ -49,7 +93,7 @@ def build_spotify_search_query(title: str, artists: List[str]) -> str:
 def fetch_youtube_oembed(video_url: str) -> Optional[Dict[str, Any]]:
     """Fetch structured metadata directly from YouTube's public oEmbed API without bot checks or datacenter IP restrictions"""
     try:
-        clean_url = video_url.split("&")[0].strip()
+        clean_url = get_canonical_youtube_url(video_url)
         oembed_url = f"https://www.youtube.com/oembed?url={urllib.request.quote(clean_url, safe=':/?=&')}&format=json"
         req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         with urllib.request.urlopen(req, timeout=5.0) as resp:
@@ -96,17 +140,18 @@ class MultiSourceEngine:
         self.MAX_CACHE_ENTRIES = 300
         self.last_error: str = ""
 
-        # High-resilience yt-dlp config with YouTube bot bypass (android_vr/tv_embedded clients bypass datacenter IP blocks)
+        # High-resilience yt-dlp config with YouTube bot bypass and real player client rotation
         self.ytdl_base_opts = {
             "format": "bestaudio/best",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
             "default_search": "ytsearch",
+            "socket_timeout": 6,
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android_vr", "tv_embedded"]
+                    "player_client": ["tv_downgraded", "android_vr", "android", "ios", "mweb", "web"]
                 }
             }
         }
@@ -116,10 +161,11 @@ class MultiSourceEngine:
             "extract_flat": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 6,
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android_vr", "tv_embedded"]
+                    "player_client": ["tv_downgraded", "android_vr", "android", "ios", "mweb", "web"]
                 }
             }
         }
@@ -136,7 +182,7 @@ class MultiSourceEngine:
         q = query.strip()
         lower = q.lower()
 
-        if lower.startswith("yt:") or "youtube.com" in lower or "youtu.be" in lower:
+        if lower.startswith("yt:") or "youtube.com" in lower or "youtu.be" in lower or extract_youtube_id(q):
             return "youtube"
         if lower.startswith("sc:") or "soundcloud.com" in lower:
             return "soundcloud"
@@ -163,9 +209,9 @@ class MultiSourceEngine:
                 return ydl.extract_info(query_or_url, download=False)
 
         try:
-            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=25.0)
+            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=12.0)
         except asyncio.TimeoutError:
-            self.last_error = f"TimeoutError: yt-dlp extraction timed out after 25s for '{query_or_url}'"
+            self.last_error = f"TimeoutError: yt-dlp extraction timed out after 12s for '{query_or_url}'"
             logger.error(self.last_error)
             return None
         except Exception as e:
@@ -174,10 +220,11 @@ class MultiSourceEngine:
             return None
 
     async def resolve_youtube(self, query: str, requester: discord.Member) -> Optional[Song]:
-        """Extract and resolve audio from YouTube URL or Search query"""
+        """Extract and resolve audio from YouTube URL, Video ID, or Search query"""
         clean_q = re.sub(r"^(?:yt:|ytsearch\d*:)\s*", "", query.strip(), flags=re.IGNORECASE)
-        is_url = bool(re.match(r"^https?://", clean_q))
-        target = clean_q if is_url else f"ytsearch1:{clean_q}"
+        vid = extract_youtube_id(clean_q)
+        is_url = bool(vid or re.match(r"^https?://", clean_q))
+        target = get_canonical_youtube_url(clean_q) if vid else (clean_q if is_url else f"ytsearch1:{clean_q}")
 
         self._clean_cache()
         cache_key = f"yt:{target}"
@@ -189,63 +236,71 @@ class MultiSourceEngine:
 
         info = await self._extract_ytdl_async(target, is_playlist=False)
 
-        # Multi-layer fallback for direct YouTube URLs if yt-dlp was challenged or blocked
-        if not info and is_url:
+        # Multi-layer fallback for direct YouTube URLs/IDs if yt-dlp was challenged or blocked
+        if not info and (vid or is_url):
+            fallback_target = get_canonical_youtube_url(clean_q) if vid else clean_q
             logger.info(f"⚠️ Direct yt-dlp extraction failed for '{clean_q}'. Attempting YouTube oEmbed fallback...")
             loop = asyncio.get_running_loop()
-            oembed_meta = await loop.run_in_executor(None, fetch_youtube_oembed, clean_q)
+            oembed_meta = await loop.run_in_executor(None, fetch_youtube_oembed, fallback_target)
             if oembed_meta:
-                yt_title = html.unescape(oembed_meta.get("title", ""))
+                raw_title = html.unescape(oembed_meta.get("title", ""))
                 uploader = html.unescape(oembed_meta.get("author_name", "Nghệ sĩ YouTube"))
                 thumb = oembed_meta.get("thumbnail_url", "")
-                logger.info(f"🟢 YouTube oEmbed resolved: '{yt_title}' by '{uploader}'. Finding alternative audio stream...")
+                clean_title = clean_music_title(raw_title)
+                logger.info(f"🟢 YouTube oEmbed resolved: '{raw_title}' (Clean: '{clean_title}') by '{uploader}'. Finding alternative audio stream...")
 
                 fallback_song = None
-                # 1. Search Zing MP3 if available
-                if self.zing_engine and yt_title:
-                    try:
-                        fallback_song = await self.zing_engine.resolve_song(yt_title, requester)
-                    except Exception as e:
-                        logger.debug(f"Zing fallback error: {e}")
+                # 1. Search Zing MP3 with clean title, then raw title
+                if self.zing_engine:
+                    for search_cand in [clean_title, f"{clean_title} {uploader}", raw_title]:
+                        if not search_cand or fallback_song:
+                            continue
+                        try:
+                            fallback_song = await self.zing_engine.resolve_song(search_cand, requester)
+                        except Exception as e:
+                            logger.debug(f"Zing fallback error for '{search_cand}': {e}")
 
-                # 2. Search SoundCloud
-                if not fallback_song and yt_title:
-                    try:
-                        fallback_song = await self.resolve_soundcloud(yt_title, requester)
-                    except Exception as e:
-                        logger.debug(f"SoundCloud fallback error: {e}")
+                # 2. Search SoundCloud with clean title, then raw title
+                if not fallback_song:
+                    for search_cand in [clean_title, f"{clean_title} {uploader}", raw_title]:
+                        if not search_cand or fallback_song:
+                            continue
+                        try:
+                            fallback_song = await self.resolve_soundcloud(search_cand, requester)
+                        except Exception as e:
+                            logger.debug(f"SoundCloud fallback error for '{search_cand}': {e}")
 
-                # 3. Search YouTube by title (often bypasses direct video bot block)
-                if not fallback_song and yt_title:
+                # 3. Search YouTube by title as last resort
+                if not fallback_song and clean_title:
                     try:
-                        search_target = f"ytsearch1:{yt_title}"
+                        search_target = f"ytsearch1:{clean_title}"
                         info_search = await self._extract_ytdl_async(search_target, is_playlist=False)
                         if info_search:
                             entry = info_search["entries"][0] if "entries" in info_search and info_search["entries"] else info_search
                             if entry and entry.get("url"):
                                 s_dur = int(entry.get("duration") or 0)
                                 fallback_song = Song({
-                                    "id": entry.get("id", ""),
-                                    "title": yt_title,
+                                    "id": entry.get("id", vid or ""),
+                                    "title": raw_title,
                                     "artists": uploader,
                                     "thumbnail": thumb or entry.get("thumbnail", ""),
                                     "streamUrl": entry.get("url"),
                                     "duration": s_dur,
                                     "durationStr": format_duration(s_dur),
                                     "source_type": "youtube",
-                                    "webpage_url": clean_q,
+                                    "webpage_url": fallback_target,
                                     "resolved_at": now
                                 }, requester)
                     except Exception as e:
                         logger.debug(f"YouTube title search fallback error: {e}")
 
                 if fallback_song:
-                    fallback_song.title = yt_title
+                    fallback_song.title = raw_title
                     fallback_song.artists = uploader
                     if thumb:
                         fallback_song.thumbnail = thumb
                     fallback_song.source_type = "youtube"
-                    fallback_song.webpage_url = clean_q
+                    fallback_song.webpage_url = fallback_target
                     song_data = {
                         "id": fallback_song.id,
                         "title": fallback_song.title,
@@ -255,7 +310,7 @@ class MultiSourceEngine:
                         "duration": fallback_song.duration_sec,
                         "durationStr": fallback_song.duration_str,
                         "source_type": "youtube",
-                        "webpage_url": clean_q,
+                        "webpage_url": fallback_target,
                         "resolved_at": now
                     }
                     self.cache[cache_key] = {"data": song_data, "expiry": now + self.CACHE_TTL}
@@ -422,9 +477,6 @@ class MultiSourceEngine:
 
         # Resolve stream via YouTube
         song = await self.resolve_youtube(search_query, requester)
-        if not song and search_query != title:
-            # Fallback to pure title search if compound search had 0 results
-            song = await self.resolve_youtube(title, requester)
 
         # Fallback to Zing if YouTube fails
         if not song and self.zing_engine:
@@ -437,6 +489,10 @@ class MultiSourceEngine:
             song = await self.resolve_soundcloud(search_query, requester)
             if not song and search_query != title:
                 song = await self.resolve_soundcloud(title, requester)
+
+        # Last resort fallback to pure title YouTube search
+        if not song and search_query != title:
+            song = await self.resolve_youtube(title, requester)
 
         if song:
             song.title = title
@@ -527,25 +583,22 @@ class MultiSourceEngine:
         if song.source_type == "youtube" and song.webpage_url:
             if not song.stream_url or force or (now - song.resolved_at > 60):
                 logger.info(f"🔄 [Anti-Stutter] Refreshing direct audio stream for: {song.title}")
-                refreshed = await self._extract_ytdl_async(song.webpage_url, is_playlist=False)
-                if refreshed:
-                    entry = refreshed["entries"][0] if "entries" in refreshed and refreshed["entries"] else refreshed
-                    new_url = entry.get("url")
-                    if new_url:
-                        song.stream_url = new_url
-                        song.resolved_at = now
-                        return new_url
+                yt_song = await self.resolve_youtube(song.webpage_url, song.requester)
+                if yt_song and yt_song.stream_url:
+                    song.stream_url = yt_song.stream_url
+                    song.resolved_at = now
+                    return song.stream_url
         elif song.source_type == "spotify":
             if not song.stream_url or force or (now - song.resolved_at > 60):
                 logger.info(f"🔄 [Anti-Stutter] Resolving audio stream for Spotify track: {song.title}")
                 search_q = build_spotify_search_query(song.title, [song.artists]) if song.artists else song.title
                 yt_song = await self.resolve_youtube(search_q, song.requester)
-                if not yt_song and search_q != song.title:
-                    yt_song = await self.resolve_youtube(song.title, song.requester)
                 if not yt_song and self.zing_engine:
                     yt_song = await self.zing_engine.resolve_song(search_q, song.requester)
                 if not yt_song:
                     yt_song = await self.resolve_soundcloud(search_q, song.requester)
+                if not yt_song and search_q != song.title:
+                    yt_song = await self.resolve_youtube(song.title, song.requester)
                 if yt_song and yt_song.stream_url:
                     song.stream_url = yt_song.stream_url
                     song.resolved_at = now
