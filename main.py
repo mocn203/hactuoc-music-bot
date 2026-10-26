@@ -14,7 +14,7 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands
 from aiohttp import web
-from multi_source import MultiSourceEngine, Song
+from multi_source import MultiSourceEngine, Song, calculate_song_similarity
 
 def format_duration(sec: int) -> str:
     m, s = divmod(max(0, int(sec)), 60)
@@ -199,7 +199,21 @@ class ZingEngine:
             search_res = await self.search(query_or_url)
             if "error" in search_res or not search_res.get("songs"):
                 return None
-            song_id = search_res["songs"][0]["id"]
+            
+            best_id = None
+            best_score = 0.0
+            for cand in (search_res.get("songs") or []):
+                cand_title = cand.get("title", "")
+                cand_artists = cand.get("artists", "")
+                score = calculate_song_similarity(query_or_url, "", cand_title, cand_artists)
+                if score > best_score:
+                    best_score = score
+                    best_id = cand.get("id")
+
+            if not best_id or best_score < 0.40:
+                logger.info(f"ℹ️ [Zing Engine] Search for '{query_or_url}' had no relevant match (best score {best_score:.2f} < 0.40). Passing to fallback.")
+                return None
+            song_id = best_id
 
         stream_res = await self.get_stream(song_id)
         if "error" in stream_res or not stream_res.get("streamUrl"):

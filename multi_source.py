@@ -102,6 +102,93 @@ def fetch_youtube_oembed(video_url: str) -> Optional[Dict[str, Any]]:
         logger.debug(f"YouTube oEmbed fetch error for '{video_url}': {e}")
         return None
 
+NOISE_RE = re.compile(
+    r'[\(\[\{【（]\s*(?:Official\s+)?(?:Music\s+Video|MV|Lyric\s+Video|Audio|Visualizer|Teaser|Trailer|Video\s+Lyrics?|Live\s+Session|Performance|Vietsub|Karaoke|Cover|Parody|Full\s+Audio|HD|4K|HQ|Remastered|prod\.?\s+by\s+[^)\]}]+)[\)\]\}】）]',
+    re.IGNORECASE
+)
+
+def clean_song_text(text: str) -> str:
+    """Clean common metadata noise patterns while keeping language scripts intact"""
+    if not text:
+        return ""
+    s = html.unescape(text)
+    s = NOISE_RE.sub(" ", s)
+    s = re.sub(r'["\'`「」『』【】\(\)\[\]\{\}]', " ", s)
+    s = re.sub(r'[\s\|\-/]+$', "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def normalize_for_comparison(text: str) -> str:
+    """Normalized alphanumeric token string for similarity comparison"""
+    s = clean_song_text(text).lower()
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def extract_tokens(text: str) -> set:
+    """Extract standard word tokens plus CJK character & bigram tokens for Asian languages"""
+    norm = normalize_for_comparison(text)
+    tokens = set(norm.split())
+    cjk = [c for c in norm if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af']
+    if cjk:
+        tokens.update(cjk)
+        for i in range(len(cjk) - 1):
+            tokens.add(cjk[i] + cjk[i+1])
+    return {t for t in tokens if t}
+
+import difflib
+
+def calculate_song_similarity(target_title: str, target_artist: str, cand_title: str, cand_artist: str) -> float:
+    """Calculate strict fuzzy & semantic similarity between two songs (0.0 to 1.0)"""
+    t_title_norm = normalize_for_comparison(target_title)
+    c_title_norm = normalize_for_comparison(cand_title)
+    
+    if not t_title_norm or not c_title_norm:
+        return 0.0
+
+    seq_ratio = difflib.SequenceMatcher(None, t_title_norm, c_title_norm).ratio()
+    
+    t_tokens = extract_tokens(target_title)
+    c_tokens = extract_tokens(cand_title)
+    
+    overlap = t_tokens.intersection(c_tokens)
+    t_len = len(t_tokens)
+    c_len = len(c_tokens)
+    
+    containment = len(overlap) / min(t_len, c_len) if min(t_len, c_len) > 0 else 0.0
+    jaccard = len(overlap) / max(len(t_tokens.union(c_tokens)), 1)
+    
+    substr_bonus = 0.0
+    if t_title_norm in c_title_norm or c_title_norm in t_title_norm:
+        substr_bonus = 0.35
+        
+    title_score = max(seq_ratio, containment * 0.75 + substr_bonus * 0.25, jaccard)
+    
+    t_art_tokens = extract_tokens(target_artist)
+    c_art_tokens = extract_tokens(cand_artist)
+    
+    artist_match = 0.0
+    if t_art_tokens and c_art_tokens:
+        if t_art_tokens.intersection(c_art_tokens):
+            artist_match = 1.0
+        elif t_art_tokens.intersection(c_tokens) or c_art_tokens.intersection(t_tokens):
+            artist_match = 0.85
+        else:
+            t_art_norm = normalize_for_comparison(target_artist)
+            c_art_norm = normalize_for_comparison(cand_artist)
+            art_ratio = difflib.SequenceMatcher(None, t_art_norm, c_art_norm).ratio() if t_art_norm and c_art_norm else 0.0
+            artist_match = art_ratio
+    else:
+        artist_match = 0.5
+        
+    if title_score < 0.25:
+        return title_score * 0.5
+        
+    return title_score * 0.7 + artist_match * 0.3
+
+def is_song_match(target_title: str, target_artist: str, cand_title: str, cand_artist: str, min_score: float = 0.50) -> Tuple[bool, float]:
+    """Return whether candidate matches target song closely above min_score threshold"""
+    score = calculate_song_similarity(target_title, target_artist, cand_title, cand_artist)
+    return score >= min_score, score
+
 class Song:
     """Universal Song model supporting Zing MP3, YouTube, SoundCloud, Spotify, and Direct Streams"""
     def __init__(self, data: Dict[str, Any], requester: discord.Member):
@@ -147,11 +234,11 @@ class MultiSourceEngine:
             "quiet": True,
             "no_warnings": True,
             "default_search": "ytsearch",
-            "socket_timeout": 6,
+            "socket_timeout": 10,
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["tv_downgraded", "android_vr", "android", "ios", "mweb", "web"]
+                    "player_client": ["visionos", "android_vr", "android", "web"]
                 }
             }
         }
@@ -161,11 +248,11 @@ class MultiSourceEngine:
             "extract_flat": True,
             "quiet": True,
             "no_warnings": True,
-            "socket_timeout": 6,
+            "socket_timeout": 10,
             "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["tv_downgraded", "android_vr", "android", "ios", "mweb", "web"]
+                    "player_client": ["visionos", "android_vr", "android", "web"]
                 }
             }
         }
@@ -199,7 +286,7 @@ class MultiSourceEngine:
         # Default query: Zing MP3 first, falls back to YouTube automatically
         return "zing_default"
 
-    async def _extract_ytdl_async(self, query_or_url: str, is_playlist: bool = False) -> Optional[Dict[str, Any]]:
+    async def _extract_ytdl_async(self, query_or_url: str, is_playlist: bool = False, timeout: float = 20.0) -> Optional[Dict[str, Any]]:
         """Run yt-dlp extraction in an executor thread with timeout protection"""
         loop = asyncio.get_running_loop()
         opts = self.ytdl_playlist_opts if is_playlist else self.ytdl_base_opts
@@ -209,9 +296,9 @@ class MultiSourceEngine:
                 return ydl.extract_info(query_or_url, download=False)
 
         try:
-            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=12.0)
+            return await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=timeout)
         except asyncio.TimeoutError:
-            self.last_error = f"TimeoutError: yt-dlp extraction timed out after 12s for '{query_or_url}'"
+            self.last_error = f"TimeoutError: yt-dlp extraction timed out after {timeout}s for '{query_or_url}'"
             logger.error(self.last_error)
             return None
         except Exception as e:
@@ -236,7 +323,7 @@ class MultiSourceEngine:
 
         info = await self._extract_ytdl_async(target, is_playlist=False)
 
-        # Multi-layer fallback for direct YouTube URLs/IDs if yt-dlp was challenged or blocked
+        # Multi-layer fallback for direct YouTube URLs/IDs if yt-dlp direct extraction was challenged or blocked
         if not info and (vid or is_url):
             fallback_target = get_canonical_youtube_url(clean_q) if vid else clean_q
             logger.info(f"⚠️ Direct yt-dlp extraction failed for '{clean_q}'. Attempting YouTube oEmbed fallback...")
@@ -247,60 +334,111 @@ class MultiSourceEngine:
                 uploader = html.unescape(oembed_meta.get("author_name", "Nghệ sĩ YouTube"))
                 thumb = oembed_meta.get("thumbnail_url", "")
                 clean_title = clean_music_title(raw_title)
-                logger.info(f"🟢 YouTube oEmbed resolved: '{raw_title}' (Clean: '{clean_title}') by '{uploader}'. Finding alternative audio stream...")
+                logger.info(f"🟢 YouTube oEmbed resolved: '{raw_title}' (Clean: '{clean_title}') by '{uploader}'. Finding verified alternative audio stream...")
 
                 fallback_song = None
-                # 1. Search Zing MP3 with clean title, then raw title
-                if self.zing_engine:
-                    for search_cand in [clean_title, f"{clean_title} {uploader}", raw_title]:
-                        if not search_cand or fallback_song:
-                            continue
-                        try:
-                            fallback_song = await self.zing_engine.resolve_song(search_cand, requester)
-                        except Exception as e:
-                            logger.debug(f"Zing fallback error for '{search_cand}': {e}")
 
-                # 2. Search SoundCloud with clean title, then raw title
-                if not fallback_song:
-                    for search_cand in [clean_title, f"{clean_title} {uploader}", raw_title]:
-                        if not search_cand or fallback_song:
-                            continue
+                # 1. Tier 1 Fallback: YouTube Search with clean_title and uploader (often bypasses direct video bot block)
+                if clean_title:
+                    for search_cand in [f"{uploader} {clean_title}", clean_title, raw_title]:
+                        if fallback_song:
+                            break
                         try:
-                            fallback_song = await self.resolve_soundcloud(search_cand, requester)
+                            search_target = f"ytsearch3:{search_cand}"
+                            info_search = await self._extract_ytdl_async(search_target, is_playlist=False, timeout=12.0)
+                            if info_search and "entries" in info_search:
+                                for entry in (info_search.get("entries") or []):
+                                    if not entry or not entry.get("url"):
+                                        continue
+                                    cand_title = entry.get("title", "")
+                                    cand_uploader = entry.get("uploader", "")
+                                    is_match, score = is_song_match(raw_title, uploader, cand_title, cand_uploader, min_score=0.50)
+                                    if is_match:
+                                        logger.info(f"✅ [YouTube Fallback Hit] Match score {score:.2f}: '{cand_title}' by '{cand_uploader}' for '{raw_title}'")
+                                        s_dur = int(entry.get("duration") or 0)
+                                        fallback_song = Song({
+                                            "id": entry.get("id", vid or ""),
+                                            "title": raw_title,
+                                            "artists": uploader,
+                                            "thumbnail": thumb or entry.get("thumbnail", ""),
+                                            "streamUrl": entry.get("url"),
+                                            "duration": s_dur,
+                                            "durationStr": format_duration(s_dur),
+                                            "source_type": "youtube",
+                                            "webpage_url": fallback_target,
+                                            "resolved_at": now
+                                        }, requester)
+                                        break
+                        except Exception as e:
+                            logger.debug(f"YouTube title search fallback error for '{search_cand}': {e}")
+
+                # 2. Tier 2 Fallback: SoundCloud Search with strict similarity check
+                if not fallback_song and clean_title:
+                    for search_cand in [f"{clean_title} {uploader}", clean_title]:
+                        if fallback_song:
+                            break
+                        try:
+                            sc_target = f"scsearch3:{search_cand}"
+                            info_sc = await self._extract_ytdl_async(sc_target, is_playlist=False, timeout=12.0)
+                            if info_sc and "entries" in info_sc:
+                                for entry in (info_sc.get("entries") or []):
+                                    if not entry or not entry.get("url"):
+                                        continue
+                                    cand_title = entry.get("title", "")
+                                    cand_uploader = entry.get("uploader", "")
+                                    is_match, score = is_song_match(raw_title, uploader, cand_title, cand_uploader, min_score=0.50)
+                                    if is_match:
+                                        logger.info(f"✅ [SoundCloud Fallback Hit] Match score {score:.2f}: '{cand_title}' by '{cand_uploader}' for '{raw_title}'")
+                                        s_dur = int(entry.get("duration") or 0)
+                                        fallback_song = Song({
+                                            "id": str(entry.get("id", "")),
+                                            "title": raw_title,
+                                            "artists": uploader,
+                                            "thumbnail": thumb or entry.get("thumbnail", ""),
+                                            "streamUrl": entry.get("url"),
+                                            "duration": s_dur,
+                                            "durationStr": format_duration(s_dur),
+                                            "source_type": "youtube",
+                                            "webpage_url": fallback_target,
+                                            "resolved_at": now
+                                        }, requester)
+                                        break
                         except Exception as e:
                             logger.debug(f"SoundCloud fallback error for '{search_cand}': {e}")
 
-                # 3. Search YouTube by title as last resort
-                if not fallback_song and clean_title:
-                    try:
-                        search_target = f"ytsearch1:{clean_title}"
-                        info_search = await self._extract_ytdl_async(search_target, is_playlist=False)
-                        if info_search:
-                            entry = info_search["entries"][0] if "entries" in info_search and info_search["entries"] else info_search
-                            if entry and entry.get("url"):
-                                s_dur = int(entry.get("duration") or 0)
-                                fallback_song = Song({
-                                    "id": entry.get("id", vid or ""),
-                                    "title": raw_title,
-                                    "artists": uploader,
-                                    "thumbnail": thumb or entry.get("thumbnail", ""),
-                                    "streamUrl": entry.get("url"),
-                                    "duration": s_dur,
-                                    "durationStr": format_duration(s_dur),
-                                    "source_type": "youtube",
-                                    "webpage_url": fallback_target,
-                                    "resolved_at": now
-                                }, requester)
-                    except Exception as e:
-                        logger.debug(f"YouTube title search fallback error: {e}")
+                # 3. Tier 3 Fallback: Zing MP3 Search with strict similarity check
+                if not fallback_song and self.zing_engine and clean_title:
+                    for search_cand in [clean_title, f"{clean_title} {uploader}"]:
+                        if fallback_song:
+                            break
+                        try:
+                            search_res = await self.zing_engine.search(search_cand)
+                            for cand in (search_res.get("songs") or []):
+                                cand_title = cand.get("title", "")
+                                cand_artists = cand.get("artists", "")
+                                is_match, score = is_song_match(raw_title, uploader, cand_title, cand_artists, min_score=0.50)
+                                if is_match:
+                                    stream_res = await self.zing_engine.get_stream(cand["id"])
+                                    if stream_res.get("success") and stream_res.get("streamUrl"):
+                                        logger.info(f"✅ [Zing Fallback Hit] Match score {score:.2f}: '{cand_title}' by '{cand_artists}' for '{raw_title}'")
+                                        s_dur = int(cand.get("duration") or 0)
+                                        fallback_song = Song({
+                                            "id": cand.get("id", ""),
+                                            "title": raw_title,
+                                            "artists": uploader,
+                                            "thumbnail": thumb or cand.get("thumbnail", ""),
+                                            "streamUrl": stream_res.get("streamUrl"),
+                                            "duration": s_dur,
+                                            "durationStr": format_duration(s_dur),
+                                            "source_type": "youtube",
+                                            "webpage_url": fallback_target,
+                                            "resolved_at": now
+                                        }, requester)
+                                        break
+                        except Exception as e:
+                            logger.debug(f"Zing fallback error for '{search_cand}': {e}")
 
                 if fallback_song:
-                    fallback_song.title = raw_title
-                    fallback_song.artists = uploader
-                    if thumb:
-                        fallback_song.thumbnail = thumb
-                    fallback_song.source_type = "youtube"
-                    fallback_song.webpage_url = fallback_target
                     song_data = {
                         "id": fallback_song.id,
                         "title": fallback_song.title,
@@ -315,6 +453,8 @@ class MultiSourceEngine:
                     }
                     self.cache[cache_key] = {"data": song_data, "expiry": now + self.CACHE_TTL}
                     return fallback_song
+                else:
+                    logger.warning(f"❌ Strict fallback verification: no candidate across YouTube/SoundCloud/Zing matched '{raw_title}' (score < 0.50). Rejecting to avoid wrong audio.")
 
         if not info:
             return None
@@ -536,10 +676,12 @@ class MultiSourceEngine:
 
         if platform == "youtube":
             song = await self.resolve_youtube(query_or_url, requester)
-            if not song and self.zing_engine:
-                song = await self.zing_engine.resolve_song(query_or_url, requester)
-            if not song:
-                song = await self.resolve_soundcloud(query_or_url, requester)
+            # Only fall back to Zing/SoundCloud if the input was NOT a direct YouTube URL or video ID
+            if not song and not extract_youtube_id(query_or_url):
+                if self.zing_engine:
+                    song = await self.zing_engine.resolve_song(query_or_url, requester)
+                if not song:
+                    song = await self.resolve_soundcloud(query_or_url, requester)
             return song
         elif platform == "soundcloud":
             return await self.resolve_soundcloud(query_or_url, requester)
