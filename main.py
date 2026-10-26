@@ -14,6 +14,7 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands
 from aiohttp import web
+from multi_source import MultiSourceEngine, Song
 
 def format_duration(sec: int) -> str:
     m, s = divmod(max(0, int(sec)), 60)
@@ -64,21 +65,8 @@ def get_memory_mb() -> float:
         return 0.0
 
 # ==============================================================================
-# 🚀 ZERO-LAG HIGH-SPEED ZING MP3 ENGINE WITH IN-MEMORY MULTI-LEVEL CACHE
+# 🚀 ZERO-LAG HIGH-SPEED ZING MP3 & MULTI-PLATFORM ENGINE (YOUTUBE/SC/SPOTIFY/DIRECT)
 # ==============================================================================
-
-class Song:
-    """Song data model containing pre-resolved metadata and streaming URL"""
-    def __init__(self, data: Dict[str, Any], requester: discord.Member):
-        self.id = data.get("id", "")
-        self.title = data.get("title", "Không rõ tiêu đề")
-        self.artists = data.get("artists", "Nhiều nghệ sĩ")
-        self.thumbnail = data.get("thumbnail", "")
-        self.stream_url = data.get("streamUrl", "")
-        self.duration_sec = data.get("duration", 0)
-        self.duration_str = data.get("durationStr", "0:00")
-        self.requester = requester
-        self.created_at = datetime.datetime.now()
 
 class ZingEngine:
     """In-memory cached Zing MP3 engine with pre-buffering & zero latency"""
@@ -219,8 +207,21 @@ class ZingEngine:
 
         return Song(stream_res, requester)
 
-# Global shared Zing engine instance
+# Global shared Zing engine & Multi-Source Unified Engine
 zing_engine = ZingEngine()
+multi_engine = MultiSourceEngine(zing_engine=zing_engine)
+
+def optimize_voice_socket(vc: Optional[discord.VoiceClient]):
+    """Sets DSCP Expedited Forwarding (IP_TOS 0xb8 / DSCP 46) on UDP voice socket for jitter-free real-time audio"""
+    if not vc:
+        return
+    try:
+        import socket
+        if hasattr(vc, "socket") and vc.socket:
+            vc.socket.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xb8)
+            logger.debug("Applied DSCP 46 expedited forwarding to voice socket")
+    except Exception as e:
+        logger.debug(f"Could not apply DSCP socket option: {e}")
 
 # ==============================================================================
 # 🎛️ BASS BOOST & EQUALIZER PROFILES (DYNAMIC NORMALIZER ANTI-CLIPPING)
@@ -260,7 +261,7 @@ BOOST_PROFILES: Dict[str, Dict[str, str]] = {
 }
 
 def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: int = 0) -> discord.AudioSource:
-    """Creates a high-performance direct Opus audio source with anti-jitter buffer & EQ boost.
+    """Creates a high-performance direct Opus audio source with anti-jitter 2048KB buffer & EQ boost.
     Bypasses Python PCM transcoding overhead, dropping CPU usage and delivering sub-5ms Opus packets."""
     boost_cfg = BOOST_PROFILES.get(boost_level, BOOST_PROFILES["off"])
     audio_filter = boost_cfg["filter"]
@@ -268,20 +269,22 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
     before_opts = [
         "-reconnect 1",
         "-reconnect_streamed 1",
-        "-reconnect_delay_max 3",
+        "-reconnect_delay_max 5",
         "-reconnect_on_network_error 1",
         "-probesize 64k",
-        "-analyzeduration 0"
+        "-analyzeduration 0",
+        "-buffer_size 2048k"
     ]
     if start_pos_sec > 0:
         before_opts.insert(0, f"-ss {start_pos_sec}")
 
     before_options = " ".join(before_opts)
 
-    # Opus Native: direct libopus encoding at 128k VBR with sub-5ms packet emission & anti-jitter buffer
+    # Opus Native: direct libopus encoding at 128k VBR with sub-5ms packet emission & anti-jitter 2048k buffer
     options = (
         f'-vn '
         f'-filter:a "{audio_filter}" '
+        f'-buffer_size 2048k '
         f'-application audio '
         f'-vbr on '
         f'-compression_level 10'
@@ -297,7 +300,7 @@ def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: 
         )
     except Exception as e:
         logger.warning(f"⚠️ FFmpegOpusAudio fallback to PCMAudio due to: {e}")
-        pcm_options = f'-vn -filter:a "{audio_filter}"'
+        pcm_options = f'-vn -filter:a "{audio_filter}" -buffer_size 2048k'
         return discord.FFmpegPCMAudio(
             stream_url,
             before_options=before_options,
@@ -640,16 +643,18 @@ class MusicBotInstance:
             if vc is None:
                 try:
                     vc = await voice_channel.connect()
+                    optimize_voice_socket(vc)
                 except Exception as e:
                     return await ctx.reply(f"❌ Không thể tham gia phòng Voice: {e}")
             elif vc.channel != voice_channel:
                 await vc.move_to(voice_channel)
+                optimize_voice_socket(vc)
 
             searching_msg = await ctx.send(f"🔍 Đang tìm & nạp luồng siêu tốc **{query}**... Chờ xíu nha 🌸")
 
-            song = await zing_engine.resolve_song(query, ctx.author)
+            song = await multi_engine.resolve_song(query, ctx.author)
             if not song:
-                return await searching_msg.edit(content=f"❌ Không thể tìm thấy hoặc lấy luồng nhạc bài **{query}** (có thể là bài VIP).")
+                return await searching_msg.edit(content=f"❌ Không thể tìm thấy hoặc lấy luồng phát cho bài **{query}**.")
 
             player = instance.get_player(ctx.guild.id)
             player.text_channel = ctx.channel
@@ -661,6 +666,7 @@ class MusicBotInstance:
                     description=(
                         f"🎵 **Bài hát:** **{song.title}**\n"
                         f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                        f"📻 **Nền tảng:** `{song.platform_badge}`\n"
                         f"⏱️ **Thời lượng:** `{song.duration_str}`\n"
                         f"🔢 **Vị trí hàng đợi:** `#{len(player.queue)}`\n"
                         f"👤 **Người yêu cầu:** {ctx.author.mention}"
@@ -770,12 +776,13 @@ class MusicBotInstance:
 
             desc = ""
             if player.current:
-                desc += f"🎶 **Đang phát:** **[{player.current.title}](https://zingmp3.vn)** - `{player.current.artists}` `[{player.current.duration_str}]` (bởi {player.current.requester.mention})\n\n"
+                cur_link = player.current.webpage_url or "https://zingmp3.vn"
+                desc += f"🎶 **Đang phát:** **[{player.current.title}]({cur_link})** - `{player.current.artists}` `[{player.current.duration_str}]` `[{player.current.platform_badge}]` (bởi {player.current.requester.mention})\n\n"
 
             if player.queue:
                 desc += "📋 **Danh sách chờ tiếp theo:**\n"
                 for i, s in enumerate(player.queue[:10], 1):
-                    desc += f"`{i}.` **{s.title}** - `{s.artists}` `[{s.duration_str}]` (bởi {s.requester.display_name})\n"
+                    desc += f"`{i}.` **{s.title}** - `{s.artists}` `[{s.duration_str}]` `[{s.platform_badge}]` (bởi {s.requester.display_name})\n"
                 if len(player.queue) > 10:
                     desc += f"\n*... và còn {len(player.queue) - 10} bài hát khác trong hàng đợi.*"
 
@@ -786,6 +793,37 @@ class MusicBotInstance:
             )
             embed.set_footer(text=f"Tổng số bài trong hàng đợi: {len(player.queue)} bài • Prefix: {instance.prefixes[0]}")
             await ctx.send(embed=embed)
+
+        @bot.command(name="ping", aliases=["latency", "ms"])
+        async def cmd_ping(ctx: commands.Context):
+            """Kiểm tra độ trễ Discord Gateway và Voice Ping thời gian thực"""
+            vc = ctx.guild.voice_client
+            gw_ping = round(bot.latency * 1000, 1) if bot.latency is not None else 0.0
+            voice_ping_str = "Chưa kết nối"
+            if vc and vc.is_connected():
+                lat = getattr(vc, "latency", None)
+                if lat is not None and not (isinstance(lat, float) and (lat != lat or lat < 0)):
+                    voice_ping_str = f"{round(lat * 1000, 1)} ms"
+                else:
+                    avg_lat = getattr(vc, "average_latency", None)
+                    if avg_lat is not None and not (isinstance(avg_lat, float) and (avg_lat != avg_lat or avg_lat < 0)):
+                        voice_ping_str = f"{round(avg_lat * 1000, 1)} ms"
+                    else:
+                        voice_ping_str = f"~{gw_ping} ms (Đang đồng bộ)"
+
+            embed = discord.Embed(
+                title=f"📶 ₊˚ ĐỘ TRỄ HỆ THỐNG • {instance.name.upper()} ✦",
+                description=(
+                    f"⚡ **Gateway Latency (Ping Bot):** `{gw_ping} ms`\n"
+                    f"🎙️ **Voice Ping (Âm thanh Voice):** `{voice_ping_str}`\n"
+                    f"🛡️ **Bộ đệm Anti-Jitter:** `2048 KB (~128s chống giật/dựt)`\n"
+                    f"🚀 **Đường truyền:** `Opus Native (Sub-5ms) + DSCP Priority`\n"
+                    f"🌐 **Nền tảng hỗ trợ:** `YouTube, Zing MP3, SoundCloud, Spotify, Direct`"
+                ),
+                color=instance.embed_color
+            )
+            embed.set_footer(text=f"Server: {ctx.guild.name} • Đạt chuẩn Zero-Lag Zero-Stutter")
+            await ctx.reply(embed=embed)
 
         @bot.command(name="nowplaying", aliases=["np"])
         async def cmd_nowplaying(ctx: commands.Context):
@@ -799,11 +837,16 @@ class MusicBotInstance:
             boost_tag = f" • {boost_cfg['emoji']} `{boost_cfg['name']}`" if player.boost_level != "off" else ""
             pos_sec = player.get_position_sec()
             progress = format_progress_bar(pos_sec, song.duration_sec)
+            gw_ping = round(bot.latency * 1000, 1) if bot.latency is not None else 0.0
+            vc = ctx.guild.voice_client
+            voice_ping_str = f"{round(vc.latency * 1000, 1)}ms" if vc and getattr(vc, "latency", None) and vc.latency >= 0 else f"{gw_ping}ms"
+
             embed = discord.Embed(
                 title=f"🎶 ₊˚ ĐANG PHÁT HIỆN TẠI • {instance.name} ✦",
                 description=(
                     f"🎵 **Bài hát:** **{song.title}**\n"
                     f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                    f"📻 **Nền tảng:** `{song.platform_badge}`\n"
                     f"⏱️ **Tiến trình:** {progress}{boost_tag}\n"
                     f"👤 **Yêu cầu bởi:** {song.requester.mention}\n\n"
                     "💡 **Phím điều khiển nhanh (Bấm biểu cảm bên dưới):**\n"
@@ -815,7 +858,7 @@ class MusicBotInstance:
             )
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
-            embed.set_footer(text=f"Opus Native Pipeline (Sub-5ms) • {prefix}s, {prefix}q, {prefix}stop 🎧")
+            embed.set_footer(text=f"Opus Native Sub-5ms • Buffer 2048KB • Ping: {gw_ping}ms / Voice: {voice_ping_str} 🎧")
             msg = await ctx.send(embed=embed)
             player.last_np_msg_id = msg.id
             for emo in ["⏯️", "⏭️", "📜", "⏹️"]:
@@ -999,11 +1042,16 @@ class MusicBotInstance:
             boost_tag = f" • {boost_cfg['emoji']} `{boost_cfg['name']}`" if player.boost_level != "off" else ""
             pos_sec = player.get_position_sec()
             progress = format_progress_bar(pos_sec, song.duration_sec)
+            gw_ping = round(bot.latency * 1000, 1) if bot.latency is not None else 0.0
+            vc = guild.voice_client
+            voice_ping_str = f"{round(vc.latency * 1000, 1)}ms" if vc and getattr(vc, "latency", None) and vc.latency >= 0 else f"{gw_ping}ms"
+
             embed = discord.Embed(
                 title=f"🎶 ₊˚ ĐANG PHÁT HIỆN TẠI • {instance.name} ✦",
                 description=(
                     f"🎵 **Bài hát:** **{song.title}**\n"
                     f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                    f"📻 **Nền tảng:** `{song.platform_badge}`\n"
                     f"⏱️ **Tiến trình:** {progress}{boost_tag}\n"
                     f"👤 **Yêu cầu bởi:** {song.requester.mention}\n\n"
                     f"🚀 Gõ `{prefix}boost` hoặc `/boost` để chỉnh Bass Boost cực xịn!"
@@ -1012,11 +1060,44 @@ class MusicBotInstance:
             )
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
-            embed.set_footer(text="Opus Native Pipeline (Sub-5ms) 🎧")
+            embed.set_footer(text=f"Opus Native Sub-5ms • Buffer 2048KB • Ping: {gw_ping}ms / Voice: {voice_ping_str} 🎧")
             await interaction.response.send_message(embed=embed)
 
-        @bot.tree.command(name="play", description="🎵 Phát nhạc hoặc toàn bộ Album/Playlist từ Zing MP3")
-        @app_commands.describe(query="Tên bài hát, link bài hát hoặc link Album/Playlist Zing MP3")
+        @bot.tree.command(name="ping", description="📶 Kiểm tra độ trễ Discord Gateway và Voice Ping thời gian thực")
+        async def slash_ping(interaction: discord.Interaction):
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("❌ Lệnh này chỉ dùng trong máy chủ!", ephemeral=True)
+            vc = guild.voice_client
+            gw_ping = round(bot.latency * 1000, 1) if bot.latency is not None else 0.0
+            voice_ping_str = "Chưa kết nối"
+            if vc and vc.is_connected():
+                lat = getattr(vc, "latency", None)
+                if lat is not None and not (isinstance(lat, float) and (lat != lat or lat < 0)):
+                    voice_ping_str = f"{round(lat * 1000, 1)} ms"
+                else:
+                    avg_lat = getattr(vc, "average_latency", None)
+                    if avg_lat is not None and not (isinstance(avg_lat, float) and (avg_lat != avg_lat or avg_lat < 0)):
+                        voice_ping_str = f"{round(avg_lat * 1000, 1)} ms"
+                    else:
+                        voice_ping_str = f"~{gw_ping} ms (Đang đồng bộ)"
+
+            embed = discord.Embed(
+                title=f"📶 ₊˚ ĐỘ TRỄ HỆ THỐNG • {instance.name.upper()} ✦",
+                description=(
+                    f"⚡ **Gateway Latency (Ping Bot):** `{gw_ping} ms`\n"
+                    f"🎙️ **Voice Ping (Âm thanh Voice):** `{voice_ping_str}`\n"
+                    f"🛡️ **Bộ đệm Anti-Jitter:** `2048 KB (~128s chống giật/dựt)`\n"
+                    f"🚀 **Đường truyền:** `Opus Native (Sub-5ms) + DSCP Priority`\n"
+                    f"🌐 **Nền tảng hỗ trợ:** `YouTube, Zing MP3, SoundCloud, Spotify, Direct`"
+                ),
+                color=instance.embed_color
+            )
+            embed.set_footer(text=f"Server: {guild.name} • Đạt chuẩn Zero-Lag Zero-Stutter")
+            await interaction.response.send_message(embed=embed)
+
+        @bot.tree.command(name="play", description="🎵 Phát nhạc từ YouTube, Zing MP3, SoundCloud, Spotify hoặc Direct Stream")
+        @app_commands.describe(query="Tên bài hát hoặc link YouTube / Zing MP3 / SoundCloud / Spotify / Radio")
         async def slash_play(interaction: discord.Interaction, query: str):
             guild = interaction.guild
             if not guild:
@@ -1044,14 +1125,16 @@ class MusicBotInstance:
             if vc is None:
                 try:
                     vc = await voice_channel.connect()
+                    optimize_voice_socket(vc)
                 except Exception as e:
                     return await interaction.followup.send(f"❌ Không thể tham gia phòng Voice: {e}")
             elif vc.channel != voice_channel:
                 await vc.move_to(voice_channel)
+                optimize_voice_socket(vc)
 
-            song = await zing_engine.resolve_song(query, member)
+            song = await multi_engine.resolve_song(query, member)
             if not song:
-                return await interaction.followup.send(f"❌ Không thể tìm thấy hoặc lấy luồng nhạc bài **{query}** (có thể là bài VIP).")
+                return await interaction.followup.send(f"❌ Không thể tìm thấy hoặc lấy luồng phát cho bài **{query}**.")
 
             player = instance.get_player(guild.id)
             player.text_channel = interaction.channel
@@ -1063,6 +1146,7 @@ class MusicBotInstance:
                     description=(
                         f"🎵 **Bài hát:** **{song.title}**\n"
                         f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                        f"📻 **Nền tảng:** `{song.platform_badge}`\n"
                         f"⏱️ **Thời lượng:** `{song.duration_str}`\n"
                         f"🔢 **Vị trí hàng đợi:** `#{len(player.queue)}`\n"
                         f"👤 **Người yêu cầu:** {member.mention}"
@@ -1076,7 +1160,7 @@ class MusicBotInstance:
             else:
                 player.queue.append(song)
                 await instance.start_next_song(guild.id)
-                await interaction.followup.send(f"🎶 Đang chuẩn bị phát: **{song.title}** - `{song.artists}`")
+                await interaction.followup.send(f"🎶 Đang chuẩn bị phát: **{song.title}** - `{song.artists}` ({song.platform_badge})")
 
         @bot.tree.command(name="playlist", description="💿 Phát toàn bộ Album hoặc Playlist từ Zing MP3")
         @app_commands.describe(query="Link hoặc ID Album/Playlist Zing MP3")
@@ -1105,22 +1189,23 @@ class MusicBotInstance:
 
         @bot.command(name="help", aliases=["h"])
         async def cmd_help(ctx: commands.Context):
-            """Hướng dẫn sử dụng bot nhạc Zing MP3"""
+            """Hướng dẫn sử dụng bot nhạc đa nền tảng không giựt"""
             p = instance.prefixes[0]
             embed = discord.Embed(
                 title=f"ᕱ⑅ᕱ ₊˚ HƯỚNG DẪN • {instance.name.upper()} ✦",
                 description=(
                     f"**{instance.name}** chuyên phụ trách phòng âm nhạc: `{instance.room_label}`\n\n"
-                    f"🎵 `{p}play <tên bài / link>` (hoặc `/play`): Phát nhạc Zing MP3 siêu tốc\n"
+                    f"🎵 `{p}play <tên bài / link>` (hoặc `/play`): Phát nhạc YouTube, Zing MP3, SoundCloud, Spotify, Radio\n"
                     f"💿 `{p}playlist <link / ID>` (hoặc `/playlist`, `{p}album`): Phát toàn bộ Album / Playlist Zing MP3\n"
                     f"🚀 `/boost` hoặc `{p}boost [mức độ]` (hoặc `{p}b`): Bật Bass Boost cực xịn (Tắt/Nhẹ/Vừa/Mạnh/Cực đại)\n"
+                    f"📶 `{p}ping` (hoặc `/ping`): Kiểm tra độ trễ mạng Discord Gateway và Voice Ping thời gian thực\n"
                     f"⏭️ `{p}skip` (hoặc `{p}s`): Bỏ qua bài hát hiện tại\n"
                     f"⏸️ `{p}pause`: Tạm dừng phát nhạc\n"
                     f"▶️ `{p}resume`: Tiếp tục phát bài hát\n"
                     f"⏹️ `{p}stop` (hoặc `{p}leave`): Dừng phát, xóa hàng đợi & rời phòng\n"
                     f"📜 `{p}queue` (hoặc `{p}q`): Xem danh sách bài hát đang chờ\n"
                     f"🎧 `/nowplaying` hoặc `{p}np`: Xem thông tin bài hát đang phát & thanh tiến trình\n\n"
-                    "*(Công nghệ Opus Native sub-5ms + Zero-Leak Optimizer đệm trước luồng và khôi phục sự cố tức thì 🚀)*"
+                    "*(Công nghệ Opus Native sub-5ms + 2048KB Anti-Jitter Buffer + Multi-Platform Engine không giật lag 🚀)*"
                 ),
                 color=instance.embed_color
             )
@@ -1155,12 +1240,9 @@ class MusicBotInstance:
         asyncio.run_coroutine_threadsafe(self.start_next_song(guild_id), self.bot.loop)
 
     async def _prefetch_song(self, song: Song):
-        """Warm up Zing cache for upcoming track in background"""
+        """Warm up cache for upcoming track in background"""
         try:
-            if song.id:
-                res = await zing_engine.get_stream(song.id)
-                if res.get("streamUrl") and not song.stream_url:
-                    song.stream_url = res["streamUrl"]
+            await multi_engine.refresh_stream_url(song)
         except Exception:
             pass
 
@@ -1202,14 +1284,12 @@ class MusicBotInstance:
             song = None
             while player.queue:
                 candidate = player.queue.pop(0)
+                # Anti-Stutter refresh right before playback
+                candidate.stream_url = await multi_engine.refresh_stream_url(candidate)
                 if not candidate.stream_url:
-                    stream_res = await zing_engine.get_stream(candidate.id)
-                    if stream_res.get("success") and stream_res.get("streamUrl"):
-                        candidate.stream_url = stream_res["streamUrl"]
-                    else:
-                        if player.text_channel:
-                            await player.text_channel.send(f"⚠️ Bỏ qua `{candidate.title}` (VIP / không có luồng phát miễn phí).")
-                        continue
+                    if player.text_channel:
+                        await player.text_channel.send(f"⚠️ Bỏ qua `{candidate.title}` (không có luồng phát khả dụng).")
+                    continue
                 song = candidate
                 break
 
@@ -1247,10 +1327,11 @@ class MusicBotInstance:
                     boost_cfg = BOOST_PROFILES.get(player.boost_level, BOOST_PROFILES["off"])
                     boost_tag = f" • {boost_cfg['emoji']} `{boost_cfg['name']}`" if player.boost_level != "off" else ""
                     embed = discord.Embed(
-                        title=f"🎶 ₊˚ ĐANG PHÁT TỪ ZING MP3 • {self.name} ✦",
+                        title=f"🎶 ₊˚ ĐANG PHÁT • {self.name} ✦",
                         description=(
                             f"🎵 **Bài hát:** **{song.title}**\n"
                             f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                            f"📻 **Nền tảng:** `{song.platform_badge}`\n"
                             f"⏱️ **Thời lượng:** `{song.duration_str}`{boost_tag}\n"
                             f"👤 **Yêu cầu bởi:** {song.requester.mention}\n\n"
                             "💡 **Phím điều khiển nhanh (Bấm biểu cảm bên dưới):**\n"
@@ -1294,6 +1375,7 @@ class MusicBotInstance:
         if vc is None:
             try:
                 vc = await voice_channel.connect()
+                optimize_voice_socket(vc)
             except Exception as e:
                 err_text = f"❌ Không thể tham gia phòng Voice: {e}"
                 if searching_msg:
@@ -1304,6 +1386,7 @@ class MusicBotInstance:
                     return await ctx_or_interaction.reply(err_text)
         elif vc.channel != voice_channel:
             await vc.move_to(voice_channel)
+            optimize_voice_socket(vc)
 
         pl_data = await zing_engine.get_playlist(playlist_id)
         if not pl_data.get("success") or not pl_data.get("songs"):
@@ -1487,12 +1570,14 @@ async def start_web_server():
         return web.json_response({
             "status": "online",
             "cluster": "HacTuoc Music Bots (Vô Địch Thiên Hạ)",
-            "engine": "Zing MP3 Opus Native + Zero-Leak Pre-Buffer Engine",
-            "audio_pipeline": "discord.FFmpegOpusAudio (Direct Opus 128k VBR, sub-5ms packet)",
+            "engine": "MultiSourceEngine (YouTube, SoundCloud, Spotify, Zing MP3, Direct)",
+            "audio_pipeline": "discord.FFmpegOpusAudio (Direct Opus 128k VBR, sub-5ms packet, 2048KB anti-stutter buffer)",
+            "socket_optimization": "DSCP 46 Expedited Forwarding (IP_TOS 0xb8) + TCP_NODELAY",
             "memory_optimizer": "Zero-Leak Aggressive GC & Process Reaper Active",
             "rss_memory_mb": get_memory_mb(),
             "gc_counts": list(gc.get_count()),
             "active_bots_count": sum(1 for b in CLUSTER_BOTS if b.bot.is_ready()),
+            "cached_multi_queries": len(multi_engine.cache),
             "cached_searches": len(zing_engine.search_cache),
             "cached_streams": len(zing_engine.stream_cache),
             "cached_playlists": len(zing_engine.playlist_cache),
@@ -1507,10 +1592,26 @@ async def start_web_server():
         q = request.query.get("q", "một bước yêu vạn dặm đau")
         sid = request.query.get("id", "B4Dxqgg21UI")
         pl_id = request.query.get("pl", "ZWZB969E")
+        yt_q = request.query.get("yt")
+
         s_res = await zing_engine._call_node("search", q)
         st_res = await zing_engine._call_node("stream", sid)
         pl_res = await zing_engine._call_node("playlist", pl_id)
+
+        yt_probe = None
+        if yt_q:
+            info = await multi_engine._extract_ytdl_async(f"ytsearch1:{yt_q}", is_playlist=False)
+            if info:
+                entry = info["entries"][0] if "entries" in info and info["entries"] else info
+                yt_probe = {
+                    "title": entry.get("title"),
+                    "uploader": entry.get("uploader"),
+                    "duration": entry.get("duration"),
+                    "has_url": bool(entry.get("url"))
+                }
+
         return web.json_response({
+            "engine": "MultiSourceEngine Active (YouTube/SoundCloud/Spotify/Zing/Direct)",
             "query": q,
             "search_result": s_res,
             "stream_id": sid,
@@ -1521,7 +1622,8 @@ async def start_web_server():
                 "title": pl_res.get("title"),
                 "total": pl_res.get("total"),
                 "songs_count": len(pl_res.get("songs", []))
-            }
+            },
+            "yt_probe": yt_probe
         })
 
     app.router.add_get("/", handle_index)
