@@ -11,8 +11,24 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 
 import discord
+from discord import app_commands, ui
 from discord.ext import commands
 from aiohttp import web
+
+def format_duration(sec: int) -> str:
+    m, s = divmod(max(0, int(sec)), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+def format_progress_bar(current_sec: int, total_sec: int, bar_len: int = 12) -> str:
+    if total_sec <= 0:
+        return f"`{format_duration(current_sec)} / 0:00`"
+    ratio = min(1.0, max(0.0, current_sec / total_sec))
+    filled = int(round(ratio * bar_len))
+    bar = "━" * filled + "🔘" + "━" * (bar_len - filled)
+    return f"`{format_duration(current_sec)}` {bar} `{format_duration(total_sec)}`"
 
 # Configure UTF-8 & logging
 sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -219,28 +235,32 @@ BOOST_PROFILES: Dict[str, Dict[str, str]] = {
     }
 }
 
-def make_audio_source(stream_url: str, boost_level: str = "off") -> discord.AudioSource:
+def make_audio_source(stream_url: str, boost_level: str = "off", start_pos_sec: int = 0) -> discord.AudioSource:
     """Creates a high-performance direct Opus audio source with anti-jitter buffer & EQ boost.
     Bypasses Python PCM transcoding overhead, dropping CPU usage and delivering sub-5ms Opus packets."""
     boost_cfg = BOOST_PROFILES.get(boost_level, BOOST_PROFILES["off"])
     audio_filter = boost_cfg["filter"]
 
-    before_options = (
-        '-reconnect 1 '
-        '-reconnect_streamed 1 '
-        '-reconnect_delay_max 3 '
-        '-reconnect_on_network_error 1 '
-        '-probesize 64k '
-        '-analyzeduration 0'
-    )
+    before_opts = [
+        "-reconnect 1",
+        "-reconnect_streamed 1",
+        "-reconnect_delay_max 3",
+        "-reconnect_on_network_error 1",
+        "-probesize 64k",
+        "-analyzeduration 0"
+    ]
+    if start_pos_sec > 0:
+        before_opts.insert(0, f"-ss {start_pos_sec}")
+
+    before_options = " ".join(before_opts)
+
     # Opus Native: direct libopus encoding at 128k VBR with sub-5ms packet emission & anti-jitter buffer
     options = (
         f'-vn '
         f'-filter:a "{audio_filter}" '
         f'-application audio '
         f'-vbr on '
-        f'-compression_level 10 '
-        f'-buffer_size 1024k'
+        f'-compression_level 10'
     )
 
     try:
@@ -253,7 +273,7 @@ def make_audio_source(stream_url: str, boost_level: str = "off") -> discord.Audi
         )
     except Exception as e:
         logger.warning(f"⚠️ FFmpegOpusAudio fallback to PCMAudio due to: {e}")
-        pcm_options = f'-vn -filter:a "{audio_filter}" -buffer_size 1024k'
+        pcm_options = f'-vn -filter:a "{audio_filter}"'
         return discord.FFmpegPCMAudio(
             stream_url,
             before_options=before_options,
@@ -274,7 +294,21 @@ class GuildPlayer:
         self.text_channel: Optional[discord.TextChannel] = None
         self.last_np_msg_id: Optional[int] = None
         self.boost_level: str = "off"
+        self.song_start_time: Optional[float] = None
+        self.pause_start_time: Optional[float] = None
+        self.total_paused_sec: float = 0.0
+        self.is_manual_stop: bool = False
         self.lock = asyncio.Lock()
+
+    def get_position_sec(self) -> int:
+        """Returns accurate current track playback position in seconds"""
+        if not self.song_start_time:
+            return 0
+        current_time = time.time()
+        paused = self.total_paused_sec
+        if self.pause_start_time:
+            paused += (current_time - self.pause_start_time)
+        return max(0, int(current_time - self.song_start_time - paused))
 
     def cleanup_current_source(self):
         """Zero-Leak: Terminate FFmpeg subprocess & destroy stream pipes immediately"""
@@ -304,10 +338,14 @@ class BoostSelectView(discord.ui.View):
         applied_live = False
         if vc and (vc.is_playing() or vc.is_paused()) and self.player.current:
             try:
-                new_source = make_audio_source(self.player.current.stream_url, self.player.boost_level)
+                elapsed = self.player.get_position_sec()
+                new_source = make_audio_source(self.player.current.stream_url, self.player.boost_level, start_pos_sec=elapsed)
                 old_source = vc.source
                 vc.source = new_source
                 self.player.current_source = new_source
+                self.player.song_start_time = time.time() - elapsed
+                self.player.total_paused_sec = 0.0
+                self.player.pause_start_time = time.time() if vc.is_paused() else None
                 if old_source:
                     try:
                         old_source.cleanup()
@@ -410,6 +448,18 @@ class MusicBotInstance:
                 status=discord.Status.online
             )
 
+            # Sync slash commands (/boost, /nowplaying)
+            if not getattr(instance, "_synced", False):
+                try:
+                    for g in bot.guilds:
+                        bot.tree.copy_global_to(guild=g)
+                        await bot.tree.sync(guild=g)
+                    await bot.tree.sync()
+                    instance._synced = True
+                    logger.info(f"[{instance.name}] Đã đồng bộ slash commands (/boost, /nowplaying) thành công!")
+                except Exception as e:
+                    logger.error(f"[{instance.name}] Lỗi đồng bộ slash command: {e}")
+
         @bot.event
         async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
             """Auto disconnect after 120s if voice room becomes empty (Zero-Leak reclamation)"""
@@ -424,7 +474,11 @@ class MusicBotInstance:
                             check_again = [m for m in before.channel.members if not m.bot]
                             if len(check_again) == 0:
                                 player = instance.get_player(guild.id)
+                                player.is_manual_stop = True
                                 player.queue.clear()
+                                player.song_start_time = None
+                                player.pause_start_time = None
+                                player.total_paused_sec = 0.0
                                 player.cleanup_current_source()
                                 player.current = None
                                 await vc.disconnect()
@@ -469,19 +523,25 @@ class MusicBotInstance:
                         await channel.send("❌ Bot không có trong phòng Voice!", delete_after=5)
                     return
                 if vc.is_playing():
+                    player.pause_start_time = time.time()
                     vc.pause()
                     if channel:
                         await channel.send("⏸️ Đã tạm dừng phát nhạc.", delete_after=5)
                 elif vc.is_paused():
+                    if player.pause_start_time:
+                        player.total_paused_sec += (time.time() - player.pause_start_time)
+                        player.pause_start_time = None
                     vc.resume()
                     if channel:
                         await channel.send("▶️ Đã tiếp tục phát nhạc.", delete_after=5)
             elif emoji_name == "⏭️":
-                if not vc or not vc.is_playing():
+                if not vc or (not vc.is_playing() and not vc.is_paused()):
                     if channel:
                         await channel.send("❌ Không có bài hát nào đang phát để bỏ qua!", delete_after=5)
                     return
-                player.cleanup_current_source()
+                player.song_start_time = None
+                player.pause_start_time = None
+                player.total_paused_sec = 0.0
                 vc.stop()
                 if channel:
                     await channel.send(f"⏭️ {member.mention} đã bỏ qua bài hát hiện tại!")
@@ -509,10 +569,15 @@ class MusicBotInstance:
             elif emoji_name == "⏹️":
                 if not vc:
                     return
+                player.is_manual_stop = True
                 player.queue.clear()
-                player.cleanup_current_source()
+                player.song_start_time = None
+                player.pause_start_time = None
+                player.total_paused_sec = 0.0
                 player.current = None
-                vc.stop()
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
+                player.cleanup_current_source()
                 await vc.disconnect()
                 gc.collect()
                 if channel:
@@ -577,10 +642,12 @@ class MusicBotInstance:
         async def cmd_skip(ctx: commands.Context):
             """Bỏ qua bài hát hiện tại"""
             vc = ctx.guild.voice_client
-            if not vc or not vc.is_playing():
+            if not vc or (not vc.is_playing() and not vc.is_paused()):
                 return await ctx.reply("❌ Không có bài hát nào đang phát để bỏ qua!")
             player = instance.get_player(ctx.guild.id)
-            player.cleanup_current_source()
+            player.song_start_time = None
+            player.pause_start_time = None
+            player.total_paused_sec = 0.0
             vc.stop()
             await ctx.send(f"⏭️ {ctx.author.mention} đã bỏ qua bài hát hiện tại!")
 
@@ -589,6 +656,8 @@ class MusicBotInstance:
             """Tạm dừng bài hát"""
             vc = ctx.guild.voice_client
             if vc and vc.is_playing():
+                player = instance.get_player(ctx.guild.id)
+                player.pause_start_time = time.time()
                 vc.pause()
                 await ctx.send(f"⏸️ Đã tạm dừng phát nhạc. Gõ `{instance.prefixes[0]}resume` để tiếp tục!")
             else:
@@ -599,6 +668,10 @@ class MusicBotInstance:
             """Tiếp tục phát nhạc"""
             vc = ctx.guild.voice_client
             if vc and vc.is_paused():
+                player = instance.get_player(ctx.guild.id)
+                if player.pause_start_time:
+                    player.total_paused_sec += (time.time() - player.pause_start_time)
+                    player.pause_start_time = None
                 vc.resume()
                 await ctx.send("▶️ Đã tiếp tục phát nhạc!")
             else:
@@ -611,10 +684,15 @@ class MusicBotInstance:
             if not vc:
                 return await ctx.reply("❌ Bot không có trong phòng Voice!")
             player = instance.get_player(ctx.guild.id)
+            player.is_manual_stop = True
             player.queue.clear()
-            player.cleanup_current_source()
+            player.song_start_time = None
+            player.pause_start_time = None
+            player.total_paused_sec = 0.0
             player.current = None
-            vc.stop()
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            player.cleanup_current_source()
             await vc.disconnect()
             gc.collect()
             await ctx.send(f"⏹️ Đã dừng phát nhạc, giải phóng bộ nhớ và {instance.name} đã rời phòng.")
@@ -647,7 +725,7 @@ class MusicBotInstance:
 
         @bot.command(name="nowplaying", aliases=["np"])
         async def cmd_nowplaying(ctx: commands.Context):
-            """Xem bài hát đang phát"""
+            """Xem bài hát đang phát kèm thanh tiến trình thời gian thực"""
             player = instance.get_player(ctx.guild.id)
             if not player.current:
                 return await ctx.reply("❌ Hiện không có bài hát nào đang phát!")
@@ -655,17 +733,19 @@ class MusicBotInstance:
             prefix = instance.prefixes[0]
             boost_cfg = BOOST_PROFILES.get(player.boost_level, BOOST_PROFILES["off"])
             boost_tag = f" • {boost_cfg['emoji']} `{boost_cfg['name']}`" if player.boost_level != "off" else ""
+            pos_sec = player.get_position_sec()
+            progress = format_progress_bar(pos_sec, song.duration_sec)
             embed = discord.Embed(
                 title=f"🎶 ₊˚ ĐANG PHÁT HIỆN TẠI • {instance.name} ✦",
                 description=(
                     f"🎵 **Bài hát:** **{song.title}**\n"
                     f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
-                    f"⏱️ **Thời lượng:** `{song.duration_str}`{boost_tag}\n"
+                    f"⏱️ **Tiến trình:** {progress}{boost_tag}\n"
                     f"👤 **Yêu cầu bởi:** {song.requester.mention}\n\n"
                     "💡 **Phím điều khiển nhanh (Bấm biểu cảm bên dưới):**\n"
                     "⏯️ `Tạm dừng / Tiếp tục` • ⏭️ `Bỏ qua bài`\n"
                     "📜 `Xem hàng đợi` • ⏹️ `Dừng & Rời phòng`\n"
-                    f"🚀 Gõ `{prefix}boost` để chỉnh Bass Boost cực xịn!"
+                    f"🚀 Gõ `{prefix}boost` hoặc `/boost` để chỉnh Bass Boost cực xịn!"
                 ),
                 color=instance.embed_color
             )
@@ -718,10 +798,14 @@ class MusicBotInstance:
                 applied_live = False
                 if vc and (vc.is_playing() or vc.is_paused()) and player.current:
                     try:
-                        new_source = make_audio_source(player.current.stream_url, player.boost_level)
+                        elapsed = player.get_position_sec()
+                        new_source = make_audio_source(player.current.stream_url, player.boost_level, start_pos_sec=elapsed)
                         old_source = vc.source
                         vc.source = new_source
                         player.current_source = new_source
+                        player.song_start_time = time.time() - elapsed
+                        player.total_paused_sec = 0.0
+                        player.pause_start_time = time.time() if vc.is_paused() else None
                         if old_source:
                             try:
                                 old_source.cleanup()
@@ -764,6 +848,109 @@ class MusicBotInstance:
             embed.set_footer(text="Bấm một trong các nút bên dưới để đổi chế độ")
             await ctx.send(embed=embed, view=view)
 
+        @bot.tree.command(name="boost", description="🚀 Tăng cường âm trầm (Bass Boost) & chất lượng âm thanh cực xịn cho phòng Voice")
+        @app_commands.describe(muc_do="Chọn mức độ Boost âm thanh")
+        @app_commands.choices(muc_do=[
+            app_commands.Choice(name="🔇 Tắt (Chuẩn Studio)", value="off"),
+            app_commands.Choice(name="🎵 Nhẹ (Acoustic / Vocal)", value="low"),
+            app_commands.Choice(name="🔊 Vừa (Club / EDM / Pop - Khuyên dùng)", value="medium"),
+            app_commands.Choice(name="🚀 Mạnh (Vinahouse / Hardstyle)", value="high"),
+            app_commands.Choice(name="💥 Cực Đại (Ultra Bass Max)", value="extreme")
+        ])
+        async def slash_boost(interaction: discord.Interaction, muc_do: Optional[app_commands.Choice[str]] = None):
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("❌ Lệnh này chỉ dùng trong máy chủ!", ephemeral=True)
+            player = instance.get_player(guild.id)
+            vc = guild.voice_client
+
+            if muc_do:
+                target = muc_do.value
+                player.boost_level = target
+                cfg = BOOST_PROFILES[target]
+
+                applied_live = False
+                if vc and (vc.is_playing() or vc.is_paused()) and player.current:
+                    try:
+                        elapsed = player.get_position_sec()
+                        new_source = make_audio_source(player.current.stream_url, player.boost_level, start_pos_sec=elapsed)
+                        old_source = vc.source
+                        vc.source = new_source
+                        player.current_source = new_source
+                        player.song_start_time = time.time() - elapsed
+                        player.total_paused_sec = 0.0
+                        player.pause_start_time = time.time() if vc.is_paused() else None
+                        if old_source:
+                            try:
+                                old_source.cleanup()
+                            except Exception:
+                                pass
+                        applied_live = True
+                    except Exception as e:
+                        logger.warning(f"Could not live-swap source: {e}")
+
+                embed = discord.Embed(
+                    title=f"{cfg['emoji']} Chế Độ Âm Thanh: {cfg['name']}",
+                    description=(
+                        f"**Mô tả:** {cfg['desc']}\n"
+                        f"**Bộ lọc:** `{cfg['filter']}`\n\n"
+                        + ("⚡ **Đã áp dụng ngay lập tức cho bài hát đang phát!**" if applied_live
+                           else "🎵 Sẽ áp dụng khi phát bài tiếp theo!")
+                    ),
+                    color=instance.embed_color
+                )
+                embed.set_footer(text="Opus Native Pipeline + Dynamic Normalizer 🚀")
+                return await interaction.response.send_message(embed=embed)
+
+            view = BoostSelectView(player, instance, interaction.user.id)
+            current_cfg = BOOST_PROFILES.get(player.boost_level, BOOST_PROFILES["off"])
+            embed = discord.Embed(
+                title=f"🚀 ₊˚ TRÌNH TỐI ƯU & BASS BOOST • {instance.name.upper()} ✦",
+                description=(
+                    f"Chế độ hiện tại: **{current_cfg['name']}** {current_cfg['emoji']}\n\n"
+                    "Chọn mức độ Bass Boost để kích hoạt ngay âm thanh sống động, mạnh mẽ:\n"
+                    "🔇 **Tắt:** Âm thanh phòng thu trung thực\n"
+                    "🎵 **Nhẹ:** Tăng nhẹ âm trầm, vocal sắc nét\n"
+                    "🔊 **Vừa:** Chuẩn Club / EDM / Pop cực căng (Khuyên dùng)\n"
+                    "🚀 **Mạnh:** Siêu trầm, đập rung màng loa\n"
+                    "💥 **Cực Đại:** Công suất đỉnh cao vô địch\n\n"
+                    "*(Tích hợp bộ lọc Dynamic Audio Normalizer tự động chống vỡ tiếng và triệt tiêu méo âm 🎧)*"
+                ),
+                color=instance.embed_color
+            )
+            embed.set_footer(text="Bấm một trong các nút bên dưới để đổi chế độ")
+            await interaction.response.send_message(embed=embed, view=view)
+
+        @bot.tree.command(name="nowplaying", description="🎶 Xem bài hát đang phát và thanh tiến trình thời gian thực")
+        async def slash_nowplaying(interaction: discord.Interaction):
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("❌ Lệnh này chỉ dùng trong máy chủ!", ephemeral=True)
+            player = instance.get_player(guild.id)
+            if not player.current:
+                return await interaction.response.send_message("❌ Hiện không có bài hát nào đang phát!", ephemeral=True)
+            song = player.current
+            prefix = instance.prefixes[0]
+            boost_cfg = BOOST_PROFILES.get(player.boost_level, BOOST_PROFILES["off"])
+            boost_tag = f" • {boost_cfg['emoji']} `{boost_cfg['name']}`" if player.boost_level != "off" else ""
+            pos_sec = player.get_position_sec()
+            progress = format_progress_bar(pos_sec, song.duration_sec)
+            embed = discord.Embed(
+                title=f"🎶 ₊˚ ĐANG PHÁT HIỆN TẠI • {instance.name} ✦",
+                description=(
+                    f"🎵 **Bài hát:** **{song.title}**\n"
+                    f"🎤 **Nghệ sĩ:** `{song.artists}`\n"
+                    f"⏱️ **Tiến trình:** {progress}{boost_tag}\n"
+                    f"👤 **Yêu cầu bởi:** {song.requester.mention}\n\n"
+                    f"🚀 Gõ `{prefix}boost` hoặc `/boost` để chỉnh Bass Boost cực xịn!"
+                ),
+                color=instance.embed_color
+            )
+            if song.thumbnail:
+                embed.set_thumbnail(url=song.thumbnail)
+            embed.set_footer(text="Opus Native Pipeline (Sub-5ms) 🎧")
+            await interaction.response.send_message(embed=embed)
+
         @bot.command(name="help", aliases=["h"])
         async def cmd_help(ctx: commands.Context):
             """Hướng dẫn sử dụng bot nhạc Zing MP3"""
@@ -773,13 +960,13 @@ class MusicBotInstance:
                 description=(
                     f"**{instance.name}** chuyên phụ trách phòng âm nhạc: `{instance.room_label}`\n\n"
                     f"🎵 `{p}play <tên bài / link>` (hoặc `{p}p`): Phát nhạc Zing MP3 siêu tốc\n"
-                    f"🚀 `{p}boost [mức độ]` (hoặc `{p}b`): Bật Bass Boost cực xịn (Tắt/Nhẹ/Vừa/Mạnh/Cực đại)\n"
+                    f"🚀 `/boost` hoặc `{p}boost [mức độ]` (hoặc `{p}b`): Bật Bass Boost cực xịn (Tắt/Nhẹ/Vừa/Mạnh/Cực đại)\n"
                     f"⏭️ `{p}skip` (hoặc `{p}s`): Bỏ qua bài hát hiện tại\n"
                     f"⏸️ `{p}pause`: Tạm dừng phát nhạc\n"
                     f"▶️ `{p}resume`: Tiếp tục phát bài hát\n"
                     f"⏹️ `{p}stop` (hoặc `{p}leave`): Dừng phát, xóa hàng đợi & rời phòng\n"
                     f"📜 `{p}queue` (hoặc `{p}q`): Xem danh sách bài hát đang chờ\n"
-                    f"🎧 `{p}np`: Xem thông tin bài hát đang phát & mở phím điều khiển\n\n"
+                    f"🎧 `/nowplaying` hoặc `{p}np`: Xem thông tin bài hát đang phát & thanh tiến trình\n\n"
                     "*(Công nghệ Opus Native sub-5ms + Zero-Leak Optimizer đệm trước luồng và khôi phục sự cố tức thì 🚀)*"
                 ),
                 color=instance.embed_color
@@ -796,12 +983,20 @@ class MusicBotInstance:
         # Explicitly destroy ffmpeg subprocess, close pipe descriptors
         player.cleanup_current_source()
         player.current = None
+        player.song_start_time = None
+        player.pause_start_time = None
+        player.total_paused_sec = 0.0
 
         # Aggressive memory cleanup
         try:
             gc.collect()
         except Exception:
             pass
+
+        # If manual stop was initiated, don't auto-start next song
+        if player.is_manual_stop:
+            player.is_manual_stop = False
+            return
 
         # Smooth transition to next song
         asyncio.run_coroutine_threadsafe(self.start_next_song(guild_id), self.bot.loop)
@@ -825,6 +1020,9 @@ class MusicBotInstance:
             player.queue.clear()
             player.cleanup_current_source()
             player.current = None
+            player.song_start_time = None
+            player.pause_start_time = None
+            player.total_paused_sec = 0.0
             gc.collect()
             return
 
@@ -834,8 +1032,11 @@ class MusicBotInstance:
 
             if not player.queue:
                 player.current = None
+                player.song_start_time = None
+                player.pause_start_time = None
+                player.total_paused_sec = 0.0
                 gc.collect()
-                if player.text_channel:
+                if player.text_channel and not player.is_manual_stop:
                     embed = discord.Embed(
                         description=f"✨ Đã phát hết danh sách bài hát trong hàng đợi! Dùng `{self.prefixes[0]}play <tên bài>` để tiếp tục nghe nhạc nhé 🎶",
                         color=self.embed_color
@@ -851,6 +1052,10 @@ class MusicBotInstance:
                 # 🚀 Opus Native Pipeline
                 source = make_audio_source(song.stream_url, player.boost_level)
                 player.current_source = source
+                player.song_start_time = time.time()
+                player.pause_start_time = None
+                player.total_paused_sec = 0.0
+                player.is_manual_stop = False
                 vc.play(source, after=lambda err: self.handle_track_finished(guild_id, err))
 
                 # Background pre-fetch next song in queue to ensure 0ms gap
@@ -892,11 +1097,23 @@ class MusicBotInstance:
                 self.handle_track_finished(guild_id, e)
 
     async def memory_optimizer_loop(self):
-        """Periodic memory maintenance: prune cache, reap dead tasks, run GC"""
+        """Periodic memory maintenance: prune cache, reap dead tasks, prune idle players, run GC"""
         while True:
             try:
                 await asyncio.sleep(300) # every 5 minutes
                 zing_engine._clean_cache()
+
+                # Zero-Leak: prune idle guild players
+                idle_guild_ids = []
+                for gid, player in list(self.players.items()):
+                    guild = self.bot.get_guild(gid)
+                    vc = guild.voice_client if guild else None
+                    if not vc and not player.current and not player.queue:
+                        player.cleanup_current_source()
+                        idle_guild_ids.append(gid)
+                for gid in idle_guild_ids:
+                    self.players.pop(gid, None)
+
                 gc.collect()
             except asyncio.CancelledError:
                 break
